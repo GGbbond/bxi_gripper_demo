@@ -105,9 +105,14 @@ class SliderUiTest(unittest.TestCase):
         self.assertEqual(self.window.torque_limit_progress.value(), 1000)
         self.assertTrue(self.window.torque_limit_active)
         self.assertIn("限力中", self.window.torque_limit_progress.format())
+        # Periodic backend status must not undo an in-progress UI edit.
         self.window.torque_limit_check.setChecked(False)
+        self.window.torque_limit_spin.setValue(0.50)
+        self.window.handle_line("TORQUE_LIMIT_STATUS 1 1.10 1.25 1")
+        self.assertFalse(self.window.torque_limit_check.isChecked())
+        self.assertEqual(self.window.torque_limit_spin.value(), 0.50)
         self.assertTrue(self.window.apply_torque_limit())
-        self.assertEqual(self.commands[-1], "SET_TORQUE_LIMIT 0 1.25")
+        self.assertEqual(self.commands[-1], "SET_TORQUE_LIMIT 0 0.50")
 
     def test_wheel_is_ignored_by_inputs_and_dropdowns(self):
         class Event:

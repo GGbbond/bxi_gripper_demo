@@ -19,6 +19,7 @@ python3 -m PyInstaller \
     --name bxi_gripper_demo \
     --add-data "build/bin/gripper_backend:build/bin" \
     --add-data "assets/gripper_demo.svg:assets" \
+    --add-data "assets/checkbox_check.svg:assets" \
     gripper_demo.py
 
 stage="$project_dir/dist/package_stage/bxi_gripper_demo"

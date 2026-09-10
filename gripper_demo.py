@@ -186,13 +186,6 @@ class GripperDemo(QMainWindow):
             QProgressBar { background: #0f172a; border: 1px solid #475569;
                            border-radius: 5px; text-align: center; min-height: 22px; }
             QProgressBar::chunk { background: #2563eb; border-radius: 4px; }
-            QCheckBox#torqueLimitCheck::indicator {
-                width: 17px; height: 17px; border: 2px solid #ffffff;
-                border-radius: 3px; background: #ffffff;
-            }
-            QCheckBox#torqueLimitCheck::indicator:checked {
-                background: #22c55e; border-color: #ffffff;
-            }
             QPlainTextEdit, QTableWidget { background: #0b1220; border: 1px solid #334155;
                                           alternate-background-color: #131e30; }
             QHeaderView::section { background: #243146; color: #e5e7eb; padding: 6px;
@@ -401,6 +394,16 @@ class GripperDemo(QMainWindow):
         gamepad_layout.addWidget(separator, 4, 0, 1, 3)
         self.torque_limit_check = QCheckBox("启用软件限力")
         self.torque_limit_check.setObjectName("torqueLimitCheck")
+        checkmark_path = resource_path("assets", "checkbox_check.svg").replace("\\", "/")
+        self.torque_limit_check.setStyleSheet(f"""
+            QCheckBox#torqueLimitCheck::indicator {{
+                width: 17px; height: 17px; border: 2px solid #ffffff;
+                border-radius: 3px; background: transparent;
+            }}
+            QCheckBox#torqueLimitCheck::indicator:checked {{
+                background: transparent; image: url({checkmark_path});
+            }}
+        """)
         self.torque_limit_check.toggled.connect(self.update_torque_limit_checkbox_text)
         self.torque_limit_spin = self.spin(0.05, 40.0, 1.0, 0.05, " N·m", 2)
         self.torque_limit_spin.setToolTip("反馈力矩达到该值后停止继续夹紧")
@@ -1021,10 +1024,11 @@ class GripperDemo(QMainWindow):
                     return
             except (ValueError, IndexError):
                 return
+            # Status arrives every 20 ms. Keep the applied state for the
+            # progress display, but never overwrite controls the user is
+            # editing before they press "应用限力".
             self.torque_limit_enabled = enabled
             self.torque_limit_nm = limit_nm
-            self.torque_limit_check.setChecked(enabled)
-            self.torque_limit_spin.setValue(limit_nm)
             if active != self.torque_limit_active:
                 self.torque_limit_active = active
                 if active:
