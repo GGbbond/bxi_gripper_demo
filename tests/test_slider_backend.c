@@ -18,6 +18,12 @@ static void reset(float position, float velocity)
     g_command_velocity = DEG_TO_RAD(velocity);
     g_position_min_deg = -360.0f;
     g_position_max_deg = 360.0f;
+    g_torque_limit_enabled = 0;
+    g_torque_limit_nm = 1.0f;
+    g_filtered_abs_torque = 0.0f;
+    g_torque_filter_sequence = 0;
+    g_torque_limited = 0;
+    memset(&g_feedback, 0, sizeof(g_feedback));
 }
 
 static void target(float position, float speed)
@@ -44,6 +50,61 @@ static void step(float dt)
 
 int main(void)
 {
+    /* Closing stops and backs off at the software torque limit. */
+    reset(0.0f, -20.0f);
+    target(-100.0f, 180.0f);
+    g_torque_limit_enabled = 1;
+    g_torque_limit_nm = 1.0f;
+    g_feedback.valid = 1;
+    g_feedback.torque = -1.1f;
+    g_feedback.sequence = 1;
+    g_feedback.updated_ms = 1000;
+    update_torque_filter_locked();
+    const float limited_start = g_command_position;
+    assert(torque_limit_blocks_closing_locked(1000));
+    update_torque_limited_reference_locked(0.002f);
+    assert(g_command_position > limited_start);
+    assert(g_command_velocity > 0.0f);
+
+    /* Hysteresis holds at 95% and releases below 90%. */
+    for (int sample = 0; sample < 80; sample++) {
+        g_feedback.torque = 0.95f;
+        g_feedback.sequence++;
+        g_feedback.updated_ms = 1001 + sample;
+        update_torque_filter_locked();
+        assert(torque_limit_blocks_closing_locked(1001 + sample));
+    }
+    for (int sample = 0; sample < 80; sample++) {
+        g_feedback.torque = 0.85f;
+        g_feedback.sequence++;
+        g_feedback.updated_ms = 1100 + sample;
+        update_torque_filter_locked();
+        torque_limit_blocks_closing_locked(1100 + sample);
+    }
+    assert(!g_torque_limited);
+
+    /* Opening remains available even when measured torque is above the limit. */
+    reset(0.0f, -20.0f);
+    target(100.0f, 180.0f);
+    g_torque_limit_enabled = 1;
+    g_feedback.valid = 1;
+    g_feedback.torque = 2.0f;
+    g_feedback.sequence = 1;
+    g_feedback.updated_ms = 2000;
+    update_torque_filter_locked();
+    assert(!torque_limit_blocks_closing_locked(2000));
+
+    /* Stale torque feedback fails safe for closing motion. */
+    reset(0.0f, 0.0f);
+    target(-100.0f, 180.0f);
+    g_torque_limit_enabled = 1;
+    g_feedback.valid = 1;
+    g_feedback.torque = 0.1f;
+    g_feedback.sequence = 1;
+    g_feedback.updated_ms = 2000;
+    update_torque_filter_locked();
+    assert(torque_limit_blocks_closing_locked(2200));
+
     /* Configured travel limits are also enforced in the backend. */
     reset(0.0f, 0.0f);
     g_position_min_deg = -20.0f;

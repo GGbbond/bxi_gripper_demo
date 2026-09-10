@@ -117,6 +117,9 @@ class GripperDemo(QMainWindow):
         self.command_position = 0.0
         self.position_min = POSITION_MIN
         self.position_max = POSITION_MAX
+        self.torque_limit_enabled = False
+        self.torque_limit_nm = 1.0
+        self.torque_limit_active = False
         self.slider_pending = None
         self.gamepad_fd = None
         self.gamepad_enabled = False
@@ -354,7 +357,7 @@ class GripperDemo(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 0, 0, 0)
 
-        gamepad_group = QGroupBox("Xbox 类手柄控制")
+        gamepad_group = QGroupBox("Xbox 类手柄控制与软件限力")
         gamepad_layout = QGridLayout(gamepad_group)
         self.gamepad_combo = NoWheelComboBox()
         self.gamepad_axis_combo = NoWheelComboBox()
@@ -384,6 +387,29 @@ class GripperDemo(QMainWindow):
         gamepad_hint.setWordWrap(True)
         gamepad_hint.setProperty("role", "muted")
         gamepad_layout.addWidget(gamepad_hint, 3, 0, 1, 3)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        gamepad_layout.addWidget(separator, 4, 0, 1, 3)
+        self.torque_limit_check = QCheckBox("启用软件限力")
+        self.torque_limit_spin = self.spin(0.05, 40.0, 1.0, 0.05, " N·m", 2)
+        self.torque_limit_spin.setToolTip("反馈力矩达到该值后停止继续夹紧")
+        self.torque_limit_button = QPushButton("应用限力")
+        self.torque_limit_button.clicked.connect(lambda: self.apply_torque_limit())
+        gamepad_layout.addWidget(self.torque_limit_check, 5, 0)
+        gamepad_layout.addWidget(self.torque_limit_spin, 5, 1)
+        gamepad_layout.addWidget(self.torque_limit_button, 5, 2)
+        self.torque_limit_progress = QProgressBar()
+        self.torque_limit_progress.setRange(0, 1000)
+        self.torque_limit_progress.setValue(0)
+        self.torque_limit_progress.setFormat("软件限力未启用")
+        gamepad_layout.addWidget(self.torque_limit_progress, 6, 0, 1, 3)
+        torque_limit_hint = QLabel(
+            "达到上限后停止继续夹紧；力矩降至 90%以下恢复，松开方向始终可用。")
+        torque_limit_hint.setWordWrap(True)
+        torque_limit_hint.setProperty("role", "muted")
+        gamepad_layout.addWidget(torque_limit_hint, 7, 0, 1, 3)
         layout.addWidget(gamepad_group)
 
         group = QGroupBox("动作程序")
@@ -535,7 +561,9 @@ class GripperDemo(QMainWindow):
                                  "command_velocity_deg_s", "target_position_deg",
                                  "feedback_position_deg", "feedback_velocity_deg_s",
                                  "feedback_torque_Nm", "feedback_sequence",
-                                 "feedback_age_ms", "power_on", "control_ready"))
+                                 "feedback_age_ms", "power_on", "control_ready",
+                                 "torque_limit_enabled", "torque_limit_Nm",
+                                 "filtered_abs_torque_Nm", "torque_limit_active"))
                 writer.writerows(self.motion_trace)
             self.append_log(f"运动诊断已导出：{path}")
         except OSError as exc:
@@ -550,6 +578,19 @@ class GripperDemo(QMainWindow):
         self.kp_spin.setValue(float(self.settings.value("kp", 300.0)))
         self.kd_spin.setValue(float(self.settings.value("kd", 5.0)))
         self.return_speed.setValue(float(self.settings.value("return_speed", 180.0)))
+        torque_limit_enabled = str(
+            self.settings.value("torque_limit_enabled", "false")).lower() in {
+                "1", "true", "yes"
+            }
+        try:
+            torque_limit_nm = float(self.settings.value("torque_limit_nm", 1.0))
+        except (TypeError, ValueError):
+            torque_limit_nm = 1.0
+        self.torque_limit_enabled = torque_limit_enabled
+        self.torque_limit_nm = max(0.05, min(40.0, torque_limit_nm))
+        self.torque_limit_check.setChecked(self.torque_limit_enabled)
+        self.torque_limit_spin.setValue(self.torque_limit_nm)
+        self.update_torque_limit_progress(0.0, False)
         trigger_axis = int(self.settings.value("gamepad_trigger_axis", DEFAULT_TRIGGER_AXIS))
         axis_index = self.gamepad_axis_combo.findData(trigger_axis)
         self.gamepad_axis_combo.setCurrentIndex(max(0, axis_index))
@@ -575,6 +616,8 @@ class GripperDemo(QMainWindow):
         self.settings.setValue("return_speed", self.return_speed.value())
         self.settings.setValue("position_min", self.position_min)
         self.settings.setValue("position_max", self.position_max)
+        self.settings.setValue("torque_limit_enabled", self.torque_limit_enabled)
+        self.settings.setValue("torque_limit_nm", self.torque_limit_nm)
         self.settings.setValue("gamepad_trigger_axis", self.gamepad_axis_combo.currentData())
         if self.gamepad_combo.currentData():
             self.settings.setValue("gamepad_device", self.gamepad_combo.currentData())
@@ -605,6 +648,41 @@ class GripperDemo(QMainWindow):
             self.action_status.setText(
                 f"夹爪活动范围已设为 {position_min:.1f}° 到 {position_max:.1f}°")
         return True
+
+    def apply_torque_limit(self, send_backend=True, announce=True):
+        if self.power_ready or self.power_requested:
+            if announce:
+                QMessageBox.warning(self, "请先下电", "修改软件力矩上限前请先将夹爪电机下电。")
+            self.torque_limit_check.setChecked(self.torque_limit_enabled)
+            self.torque_limit_spin.setValue(self.torque_limit_nm)
+            return False
+        self.torque_limit_enabled = self.torque_limit_check.isChecked()
+        self.torque_limit_nm = self.torque_limit_spin.value()
+        self.torque_limit_active = False
+        self.update_torque_limit_progress(0.0, False)
+        if send_backend and self.connected:
+            self.send_command(
+                f"SET_TORQUE_LIMIT {int(self.torque_limit_enabled)} "
+                f"{self.torque_limit_nm:.2f}")
+        if announce:
+            if self.torque_limit_enabled:
+                self.action_status.setText(
+                    f"软件夹持力矩上限已设为 {self.torque_limit_nm:.2f} N·m")
+            else:
+                self.action_status.setText("软件夹持力矩限制已关闭")
+        return True
+
+    def update_torque_limit_progress(self, filtered_torque, active):
+        if not self.torque_limit_enabled:
+            self.torque_limit_progress.setValue(0)
+            self.torque_limit_progress.setFormat("软件限力未启用")
+            return
+        ratio = abs(filtered_torque) / max(self.torque_limit_nm, 0.05)
+        self.torque_limit_progress.setValue(round(min(ratio, 1.0) * 1000))
+        prefix = "限力中 · " if active else ""
+        self.torque_limit_progress.setFormat(
+            f"{prefix}|力矩| {abs(filtered_torque):.2f} / "
+            f"{self.torque_limit_nm:.2f} N·m")
 
     def refresh_gamepads(self, preferred=None):
         if self.gamepad_enabled:
@@ -830,6 +908,9 @@ class GripperDemo(QMainWindow):
         self.apply_device()
         self.send_command(
             f"SET_POSITION_LIMITS {self.position_min:.2f} {self.position_max:.2f}")
+        self.send_command(
+            f"SET_TORQUE_LIMIT {int(self.torque_limit_enabled)} "
+            f"{self.torque_limit_nm:.2f}")
         self.send_command(f"SET_GAINS {self.kp_spin.value():.2f} {self.kd_spin.value():.2f}")
         self.update_ui()
         return True
@@ -867,6 +948,8 @@ class GripperDemo(QMainWindow):
                      self.temperature_card):
             card.clear()
         self.feedback_label.setText("实时: -- deg")
+        self.torque_limit_active = False
+        self.update_torque_limit_progress(0.0, False)
         self.update_ui()
 
     def send_command(self, command, quiet=False):
@@ -911,12 +994,38 @@ class GripperDemo(QMainWindow):
         parts = line.split()
         key = parts[0]
         if key == "TRACE":
-            if len(parts) == 12:
+            if len(parts) in (12, 16):
                 try:
                     if all(math.isfinite(float(value)) for value in parts[1:]):
-                        self.motion_trace.append(tuple(parts[1:]))
+                        values = tuple(parts[1:])
+                        if len(parts) == 12:
+                            values += ("0", "0", "0", "0")
+                        self.motion_trace.append(values)
                 except ValueError:
                     pass
+            return
+        if key == "TORQUE_LIMIT_STATUS" and len(parts) == 5:
+            try:
+                enabled = parts[1] == "1"
+                filtered_torque = float(parts[2])
+                limit_nm = float(parts[3])
+                active = parts[4] == "1"
+                if not math.isfinite(filtered_torque) or not math.isfinite(limit_nm):
+                    return
+            except (ValueError, IndexError):
+                return
+            self.torque_limit_enabled = enabled
+            self.torque_limit_nm = limit_nm
+            self.torque_limit_check.setChecked(enabled)
+            self.torque_limit_spin.setValue(limit_nm)
+            if active != self.torque_limit_active:
+                self.torque_limit_active = active
+                if active:
+                    self.action_status.setText(
+                        f"限力中：已达到 {limit_nm:.2f} N·m，停止继续夹紧")
+                else:
+                    self.action_status.setText("力矩已回落，允许继续夹紧")
+            self.update_torque_limit_progress(filtered_torque, active)
             return
         try:
             if key == "POS":
@@ -1000,6 +1109,12 @@ class GripperDemo(QMainWindow):
             self.action_status.setText(f"Kp/Kd 已应用：{parts[1]} / {parts[2]}")
         elif key == "POSITION_LIMITS_SET":
             self.action_status.setText(f"夹爪活动范围已应用：{parts[1]}° 到 {parts[2]}°")
+        elif key == "TORQUE_LIMIT_SET":
+            enabled = len(parts) > 1 and parts[1] == "1"
+            value = parts[2] if len(parts) > 2 else f"{self.torque_limit_nm:.2f}"
+            self.action_status.setText(
+                f"软件夹持力矩上限已应用：{value} N·m" if enabled
+                else "软件夹持力矩限制已关闭")
         elif key == "ERROR":
             backend_message = " ".join(parts[1:])
             if backend_message in {
@@ -1037,6 +1152,8 @@ class GripperDemo(QMainWindow):
             "power off before changing position limits": "请先下电再修改夹爪活动范围",
             "invalid position limits": "夹爪活动范围无效",
             "position outside configured limits": "目标位置超出夹爪活动范围",
+            "power off before changing torque limit": "请先下电再修改软件力矩上限",
+            "invalid torque limit": "软件力矩上限无效",
         }.get(message, message)
 
     def poll_status(self):
@@ -1462,6 +1579,9 @@ class GripperDemo(QMainWindow):
         limits_editable = not (self.power_ready or self.power_requested)
         self.position_min_spin.setEnabled(limits_editable)
         self.position_max_spin.setEnabled(limits_editable)
+        self.torque_limit_check.setEnabled(limits_editable)
+        self.torque_limit_spin.setEnabled(limits_editable)
+        self.torque_limit_button.setEnabled(limits_editable)
         self.gamepad_button.setText(
             "停止右扳机控制" if self.gamepad_enabled else "启用右扳机控制")
         self.gamepad_button.setEnabled(controls_ready or self.gamepad_enabled)

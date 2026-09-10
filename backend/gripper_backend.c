@@ -46,7 +46,14 @@
 #define ZERO_POSITION_TOLERANCE_DEG 2.0f
 /* Critically damped slider follower: ~0.3 s to settle, no per-target velocity reset. */
 #define STREAM_FOLLOW_RATE 20.0f
-#define BACKEND_REVISION "position-limits-v3"
+#define TORQUE_LIMIT_RELEASE_RATIO 0.90f
+#define TORQUE_FILTER_ALPHA 0.10f
+#define TORQUE_FEEDBACK_TIMEOUT_MS 100LL
+#define TORQUE_BACKOFF_START_RATIO 1.05f
+#define TORQUE_BACKOFF_MIN_DEG_S 0.5f
+#define TORQUE_BACKOFF_GAIN_DEG_S_PER_NM 5.0f
+#define TORQUE_BACKOFF_MAX_DEG_S 10.0f
+#define BACKEND_REVISION "torque-limit-v4"
 
 typedef struct {
     float position;
@@ -96,6 +103,11 @@ static float g_target_kp = 300.0f;
 static float g_target_kd = 5.0f;
 static float g_position_min_deg = -360.0f;
 static float g_position_max_deg = 360.0f;
+static int g_torque_limit_enabled = 0;
+static float g_torque_limit_nm = 1.0f;
+static float g_filtered_abs_torque = 0.0f;
+static unsigned int g_torque_filter_sequence = 0;
+static int g_torque_limited = 0;
 static motor_feedback g_feedback;
 static motion_state g_motion;
 static pthread_t g_control_thread;
@@ -112,6 +124,13 @@ static float clampf(float value, float low, float high)
     if (value < low) return low;
     if (value > high) return high;
     return value;
+}
+
+static void reset_torque_supervisor_locked(void)
+{
+    g_torque_limited = 0;
+    g_filtered_abs_torque = 0.0f;
+    g_torque_filter_sequence = 0;
 }
 
 static uint32_t float_to_uint(float value, float low, float high, int bits)
@@ -210,6 +229,7 @@ static void power_off_locked(void)
     g_command_velocity = 0.0f;
     g_command_kp = 0.0f;
     g_command_kd = 0.0f;
+    reset_torque_supervisor_locked();
     pthread_mutex_unlock(&g_state_lock);
     if (entered) {
         send_mode(bus, motor_id, 0xFD);
@@ -324,6 +344,83 @@ static void update_stream_locked(float dt)
     g_command_position += 0.5f * (old_velocity + g_command_velocity) * dt;
 }
 
+static void update_torque_filter_locked(void)
+{
+    if (!g_feedback.valid || g_feedback.sequence == g_torque_filter_sequence) return;
+    const float sample = fabsf(g_feedback.torque);
+    if (g_torque_filter_sequence == 0) {
+        g_filtered_abs_torque = sample;
+    } else {
+        g_filtered_abs_torque +=
+            (sample - g_filtered_abs_torque) * TORQUE_FILTER_ALPHA;
+    }
+    g_torque_filter_sequence = g_feedback.sequence;
+}
+
+static void restart_move_from_reference_locked(long long now_ms)
+{
+    if (g_motion.kind != MOTION_MOVE) return;
+    const float distance = fabsf(g_motion.target_position - g_command_position);
+    g_motion.start_position = g_command_position;
+    g_motion.start_velocity = 0.0f;
+    g_motion.duration = fmaxf(
+        0.05f, distance * MOVE_PEAK_FACTOR / g_motion.peak_velocity);
+    g_motion.started_ms = now_ms;
+}
+
+static int torque_limit_blocks_closing_locked(long long now_ms)
+{
+    if (!g_torque_limit_enabled || g_motion.kind == MOTION_IDLE) {
+        g_torque_limited = 0;
+        return 0;
+    }
+
+    /* Decreasing angle closes this gripper. Never block an opening command:
+     * the operator must be able to release the load while torque is high. */
+    const int closing =
+        g_motion.target_position < g_command_position - DEG_TO_RAD(0.001f);
+    if (!closing) {
+        g_torque_limited = 0;
+        return 0;
+    }
+
+    const int feedback_stale =
+        !g_feedback.valid || now_ms - g_feedback.updated_ms > TORQUE_FEEDBACK_TIMEOUT_MS;
+    const float raw_abs_torque = fabsf(g_feedback.torque);
+    if (feedback_stale || (!g_torque_limited &&
+            (raw_abs_torque >= g_torque_limit_nm ||
+             g_filtered_abs_torque >= g_torque_limit_nm))) {
+        g_torque_limited = 1;
+    } else if (g_torque_limited &&
+               raw_abs_torque <= g_torque_limit_nm * TORQUE_LIMIT_RELEASE_RATIO &&
+               g_filtered_abs_torque <= g_torque_limit_nm * TORQUE_LIMIT_RELEASE_RATIO) {
+        g_torque_limited = 0;
+        restart_move_from_reference_locked(now_ms);
+    }
+    return g_torque_limited;
+}
+
+static void update_torque_limited_reference_locked(float dt)
+{
+    const float measured = fmaxf(
+        fabsf(g_feedback.torque), g_filtered_abs_torque);
+    const float excess = measured - g_torque_limit_nm * TORQUE_BACKOFF_START_RATIO;
+    g_command_velocity = 0.0f;
+    if (excess <= 0.0f) return;
+
+    /* Back off slowly in the opening direction. Reducing position error also
+     * reduces the motor's internally generated MIT PD torque. */
+    const float backoff_deg_s = clampf(
+        TORQUE_BACKOFF_MIN_DEG_S + excess * TORQUE_BACKOFF_GAIN_DEG_S_PER_NM,
+        TORQUE_BACKOFF_MIN_DEG_S, TORQUE_BACKOFF_MAX_DEG_S);
+    const float upper = DEG_TO_RAD(g_position_max_deg);
+    const float step = DEG_TO_RAD(backoff_deg_s) * dt;
+    if (g_command_position < upper) {
+        g_command_position = fminf(upper, g_command_position + step);
+        g_command_velocity = DEG_TO_RAD(backoff_deg_s);
+    }
+}
+
 static void *control_loop(void *arg)
 {
     (void)arg;
@@ -338,7 +435,9 @@ static void *control_loop(void *arg)
         int completed = 0;
         motor_feedback feedback;
         float trace_position, trace_velocity, trace_target;
+        float trace_filtered_torque, trace_torque_limit;
         int trace_power, trace_ready;
+        int trace_torque_limit_enabled, trace_torque_limited;
         long long trace_time;
         long long now = monotonic_ms();
         float dt = clampf((float)(now - last_ms) / 1000.0f, 0.001f, 0.02f);
@@ -355,13 +454,23 @@ static void *control_loop(void *arg)
             send_enter = 1;
         }
         if (g_power_on && g_mode_entered && g_control_ready) {
+            int torque_blocked = 0;
+            update_torque_filter_locked();
             if (g_motion.kind == MOTION_MOVE) {
-                update_move_locked(now, &completed);
+                torque_blocked = torque_limit_blocks_closing_locked(now);
+                if (torque_blocked) update_torque_limited_reference_locked(dt);
+                else update_move_locked(now, &completed);
             } else if (g_motion.kind == MOTION_STREAM) {
-                update_stream_locked(dt);
+                torque_blocked = torque_limit_blocks_closing_locked(now);
+                if (torque_blocked) update_torque_limited_reference_locked(dt);
+                else update_stream_locked(dt);
+            } else {
+                g_torque_limited = 0;
             }
             const float blend = 1.0f - expf(-dt / 0.02f);
-            g_command_kp += (g_target_kp - g_command_kp) * blend;
+            if (!torque_blocked) {
+                g_command_kp += (g_target_kp - g_command_kp) * blend;
+            }
             g_command_kd += (g_target_kd - g_command_kd) * blend;
             pack_control(data, g_command_position, g_command_velocity,
                          g_command_kp, g_command_kd);
@@ -375,6 +484,10 @@ static void *control_loop(void *arg)
         trace_power = g_power_on;
         trace_ready = g_control_ready;
         trace_time = monotonic_ms();
+        trace_filtered_torque = g_filtered_abs_torque;
+        trace_torque_limit = g_torque_limit_nm;
+        trace_torque_limit_enabled = g_torque_limit_enabled;
+        trace_torque_limited = g_torque_limited;
         pthread_mutex_unlock(&g_state_lock);
 
         if (send_enter) {
@@ -392,12 +505,17 @@ static void *control_loop(void *arg)
             }
             /* Atomic snapshot for comparing reference commands and feedback.
              * Invalid feedback is explicitly marked by age=-1. */
-            send_line("TRACE %lld %.6f %.6f %.6f %.6f %.6f %.6f %u %lld %d %d\n",
+            send_line("TRACE %lld %.6f %.6f %.6f %.6f %.6f %.6f %u %lld %d %d "
+                      "%d %.6f %.6f %d\n",
                       trace_time, RAD_TO_DEG(trace_position), RAD_TO_DEG(trace_velocity),
                       RAD_TO_DEG(trace_target), RAD_TO_DEG(feedback.position),
                       RAD_TO_DEG(feedback.velocity), feedback.torque, feedback.sequence,
                       feedback.valid ? trace_time - feedback.updated_ms : -1LL,
-                      trace_power, trace_ready);
+                      trace_power, trace_ready, trace_torque_limit_enabled,
+                      trace_torque_limit, trace_filtered_torque, trace_torque_limited);
+            send_line("TORQUE_LIMIT_STATUS %d %.6f %.6f %d\n",
+                      trace_torque_limit_enabled, trace_filtered_torque,
+                      trace_torque_limit, trace_torque_limited);
         }
         usleep(CONTROL_PERIOD_US);
     }
@@ -444,6 +562,7 @@ static void stop_and_hold(void)
     g_motion.kind = MOTION_IDLE;
     g_command_position = g_feedback.valid ? g_feedback.position : g_command_position;
     g_command_velocity = 0.0f;
+    g_torque_limited = 0;
     pthread_mutex_unlock(&g_state_lock);
 }
 
@@ -468,6 +587,7 @@ static void handle_zero(int fd)
         g_control_ready = 0;
         g_mode_entered = 0;
         g_command_velocity = 0.0f;
+        reset_torque_supervisor_locked();
     }
     pthread_mutex_unlock(&g_state_lock);
     if (!allowed) {
@@ -573,6 +693,7 @@ static void handle_command(int fd, const char *command)
         }
         g_bus = value;
         g_feedback.valid = 0;
+        reset_torque_supervisor_locked();
         pthread_mutex_unlock(&g_state_lock);
         send_line("CLAW_CAN_SET %u\n", value);
         return;
@@ -586,6 +707,7 @@ static void handle_command(int fd, const char *command)
         }
         g_motor_id = value;
         g_feedback.valid = 0;
+        reset_torque_supervisor_locked();
         pthread_mutex_unlock(&g_state_lock);
         send_line("MOTOR_ID_SET %u\n", value);
         return;
@@ -608,6 +730,25 @@ static void handle_command(int fd, const char *command)
         send_line("POSITION_LIMITS_SET %.2f %.2f\n", position, speed);
         return;
     }
+    if (sscanf(command, "SET_TORQUE_LIMIT %u %f", &value, &position) == 2) {
+        if (value > 1 || !isfinite(position) || position < 0.05f ||
+            position > T_MAX) {
+            send_line("ERROR invalid torque limit\n");
+            return;
+        }
+        pthread_mutex_lock(&g_state_lock);
+        if (g_power_on) {
+            pthread_mutex_unlock(&g_state_lock);
+            send_line("ERROR power off before changing torque limit\n");
+            return;
+        }
+        g_torque_limit_enabled = (int)value;
+        g_torque_limit_nm = position;
+        reset_torque_supervisor_locked();
+        pthread_mutex_unlock(&g_state_lock);
+        send_line("TORQUE_LIMIT_SET %u %.2f\n", value, position);
+        return;
+    }
     if (strcmp(command, "MOTOR_POWER_ON") == 0) {
         pthread_mutex_lock(&g_state_lock);
         if (!g_power_on) {
@@ -620,6 +761,7 @@ static void handle_command(int fd, const char *command)
             g_power_on = 1;
             g_power_started_ms = monotonic_ms();
             g_feedback.valid = 0;
+            reset_torque_supervisor_locked();
         }
         g_enable_requested = 1;
         pthread_mutex_unlock(&g_state_lock);
@@ -687,6 +829,7 @@ static void handle_command(int fd, const char *command)
         g_enable_requested = 0;
         g_control_ready = 0;
         g_mode_entered = 0;
+        reset_torque_supervisor_locked();
         pthread_mutex_unlock(&g_state_lock);
         send_mode(bus, motor_id, 0xFD);
         send_line("CLAW_DISABLED\n");
@@ -704,6 +847,7 @@ static void handle_command(int fd, const char *command)
         g_control_ready = 0;
         g_mode_entered = 0;
         g_enable_requested = 1;
+        reset_torque_supervisor_locked();
         pthread_mutex_unlock(&g_state_lock);
         send_line("CLAW_ENABLING\n");
         log_line("Re-enabling claw motor without cycling hardware power");
