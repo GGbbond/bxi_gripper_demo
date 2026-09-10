@@ -93,8 +93,10 @@ class SliderUiTest(unittest.TestCase):
         self.assertTrue(self.commands[0].startswith("CLAW_MOVE 40.00 "))
 
     def test_torque_limit_setting_and_status(self):
-        self.window.power_ready = False
-        self.window.power_requested = False
+        self.window.power_ready = True
+        self.window.power_requested = True
+        self.window.update_ui()
+        self.assertTrue(self.window.torque_limit_button.isEnabled())
         self.window.torque_limit_check.setChecked(True)
         self.window.torque_limit_spin.setValue(1.25)
         self.assertTrue(self.window.apply_torque_limit())
@@ -103,6 +105,9 @@ class SliderUiTest(unittest.TestCase):
         self.assertEqual(self.window.torque_limit_progress.value(), 1000)
         self.assertTrue(self.window.torque_limit_active)
         self.assertIn("限力中", self.window.torque_limit_progress.format())
+        self.window.torque_limit_check.setChecked(False)
+        self.assertTrue(self.window.apply_torque_limit())
+        self.assertEqual(self.commands[-1], "SET_TORQUE_LIMIT 0 1.25")
 
     def test_wheel_is_ignored_by_inputs_and_dropdowns(self):
         class Event:

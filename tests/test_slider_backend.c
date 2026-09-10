@@ -50,6 +50,15 @@ static void step(float dt)
 
 int main(void)
 {
+    /* Torque limit configuration is accepted while the motor is powered. */
+    reset(0.0f, 0.0f);
+    handle_command(-1, "SET_TORQUE_LIMIT 1 0.50");
+    assert(g_torque_limit_enabled == 1);
+    assert(fabsf(g_torque_limit_nm - 0.50f) < 1e-6f);
+    handle_command(-1, "SET_TORQUE_LIMIT 0 0.75");
+    assert(g_torque_limit_enabled == 0);
+    assert(fabsf(g_torque_limit_nm - 0.75f) < 1e-6f);
+
     /* Closing stops and backs off at the software torque limit. */
     reset(0.0f, -20.0f);
     target(-100.0f, 180.0f);

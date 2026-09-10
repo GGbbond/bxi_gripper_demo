@@ -53,7 +53,7 @@
 #define TORQUE_BACKOFF_MIN_DEG_S 0.5f
 #define TORQUE_BACKOFF_GAIN_DEG_S_PER_NM 5.0f
 #define TORQUE_BACKOFF_MAX_DEG_S 10.0f
-#define BACKEND_REVISION "torque-limit-v4"
+#define BACKEND_REVISION "torque-limit-live-v5"
 
 typedef struct {
     float position;
@@ -737,11 +737,6 @@ static void handle_command(int fd, const char *command)
             return;
         }
         pthread_mutex_lock(&g_state_lock);
-        if (g_power_on) {
-            pthread_mutex_unlock(&g_state_lock);
-            send_line("ERROR power off before changing torque limit\n");
-            return;
-        }
         g_torque_limit_enabled = (int)value;
         g_torque_limit_nm = position;
         reset_torque_supervisor_locked();
