@@ -2,9 +2,12 @@
 import json
 import csv
 from collections import deque
+import errno
+import glob
 import math
 import os
 import socket
+import struct
 import sys
 import time
 
@@ -29,6 +32,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QProgressBar,
     QSlider,
     QSplitter,
     QTableWidget,
@@ -45,6 +49,10 @@ POSITION_MIN = -360.0
 POSITION_MAX = 360.0
 POSITION_LIMIT_STEP = 0.1
 PEAK_FACTOR = 1.875
+JOYSTICK_EVENT_SIZE = 8
+JOYSTICK_EVENT_AXIS = 0x02
+JOYSTICK_EVENT_INIT = 0x80
+DEFAULT_TRIGGER_AXIS = 5
 
 
 def resource_path(*parts):
@@ -110,6 +118,10 @@ class GripperDemo(QMainWindow):
         self.position_min = POSITION_MIN
         self.position_max = POSITION_MAX
         self.slider_pending = None
+        self.gamepad_fd = None
+        self.gamepad_enabled = False
+        self.gamepad_trigger_bipolar = None
+        self.gamepad_last_position = None
         self.action_running = False
         self.action_paused = False
         self.action_index = 0
@@ -136,6 +148,9 @@ class GripperDemo(QMainWindow):
         self.slider_timer = QTimer(self)
         self.slider_timer.setInterval(20)
         self.slider_timer.timeout.connect(self.flush_slider)
+        self.gamepad_timer = QTimer(self)
+        self.gamepad_timer.setInterval(20)
+        self.gamepad_timer.timeout.connect(self.poll_gamepad)
         self.update_ui()
 
     def build_ui(self):
@@ -165,6 +180,9 @@ class GripperDemo(QMainWindow):
                                border-radius: 8px; }
             QComboBox, QDoubleSpinBox { background: #0f172a; border: 1px solid #475569;
                                        border-radius: 5px; padding: 5px; min-height: 22px; }
+            QProgressBar { background: #0f172a; border: 1px solid #475569;
+                           border-radius: 5px; text-align: center; min-height: 22px; }
+            QProgressBar::chunk { background: #2563eb; border-radius: 4px; }
             QPlainTextEdit, QTableWidget { background: #0b1220; border: 1px solid #334155;
                                           alternate-background-color: #131e30; }
             QHeaderView::section { background: #243146; color: #e5e7eb; padding: 6px;
@@ -335,6 +353,39 @@ class GripperDemo(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 0, 0, 0)
+
+        gamepad_group = QGroupBox("Xbox 类手柄控制")
+        gamepad_layout = QGridLayout(gamepad_group)
+        self.gamepad_combo = NoWheelComboBox()
+        self.gamepad_axis_combo = NoWheelComboBox()
+        for axis in range(16):
+            label = f"轴 {axis}"
+            if axis == DEFAULT_TRIGGER_AXIS:
+                label += "（常见 Xbox RT）"
+            self.gamepad_axis_combo.addItem(label, axis)
+        self.gamepad_refresh_button = QPushButton("刷新")
+        self.gamepad_refresh_button.clicked.connect(self.refresh_gamepads)
+        self.gamepad_button = QPushButton("启用右扳机控制")
+        self.gamepad_button.setCheckable(True)
+        self.gamepad_button.clicked.connect(self.set_gamepad_enabled)
+        self.trigger_progress = QProgressBar()
+        self.trigger_progress.setRange(0, 1000)
+        self.trigger_progress.setValue(0)
+        self.trigger_progress.setFormat("扳机按下 0.0%")
+        gamepad_layout.addWidget(QLabel("手柄设备"), 0, 0)
+        gamepad_layout.addWidget(self.gamepad_combo, 0, 1)
+        gamepad_layout.addWidget(self.gamepad_refresh_button, 0, 2)
+        gamepad_layout.addWidget(QLabel("右扳机轴"), 1, 0)
+        gamepad_layout.addWidget(self.gamepad_axis_combo, 1, 1)
+        gamepad_layout.addWidget(self.gamepad_button, 1, 2)
+        gamepad_layout.addWidget(self.trigger_progress, 2, 0, 1, 3)
+        gamepad_hint = QLabel(
+            "启用前请松开右扳机；松开对应活动范围最大值，完全按下对应最小值。")
+        gamepad_hint.setWordWrap(True)
+        gamepad_hint.setProperty("role", "muted")
+        gamepad_layout.addWidget(gamepad_hint, 3, 0, 1, 3)
+        layout.addWidget(gamepad_group)
+
         group = QGroupBox("动作程序")
         group_layout = QVBoxLayout(group)
         self.table = QTableWidget(0, 4)
@@ -499,6 +550,10 @@ class GripperDemo(QMainWindow):
         self.kp_spin.setValue(float(self.settings.value("kp", 300.0)))
         self.kd_spin.setValue(float(self.settings.value("kd", 5.0)))
         self.return_speed.setValue(float(self.settings.value("return_speed", 180.0)))
+        trigger_axis = int(self.settings.value("gamepad_trigger_axis", DEFAULT_TRIGGER_AXIS))
+        axis_index = self.gamepad_axis_combo.findData(trigger_axis)
+        self.gamepad_axis_combo.setCurrentIndex(max(0, axis_index))
+        self.refresh_gamepads(str(self.settings.value("gamepad_device", "/dev/input/js0")))
         try:
             position_min = float(self.settings.value("position_min", POSITION_MIN))
             position_max = float(self.settings.value("position_max", POSITION_MAX))
@@ -520,6 +575,9 @@ class GripperDemo(QMainWindow):
         self.settings.setValue("return_speed", self.return_speed.value())
         self.settings.setValue("position_min", self.position_min)
         self.settings.setValue("position_max", self.position_max)
+        self.settings.setValue("gamepad_trigger_axis", self.gamepad_axis_combo.currentData())
+        if self.gamepad_combo.currentData():
+            self.settings.setValue("gamepad_device", self.gamepad_combo.currentData())
 
     def apply_position_limits(self, send_backend=True, announce=True):
         position_min = self.position_min_spin.value()
@@ -547,6 +605,140 @@ class GripperDemo(QMainWindow):
             self.action_status.setText(
                 f"夹爪活动范围已设为 {position_min:.1f}° 到 {position_max:.1f}°")
         return True
+
+    def refresh_gamepads(self, preferred=None):
+        if self.gamepad_enabled:
+            return
+        if isinstance(preferred, bool):
+            preferred = None
+        if preferred is None:
+            preferred = self.gamepad_combo.currentData()
+        devices = sorted(glob.glob("/dev/input/js*"))
+        self.gamepad_combo.blockSignals(True)
+        self.gamepad_combo.clear()
+        for path in devices:
+            self.gamepad_combo.addItem(path, path)
+        if devices:
+            selected = self.gamepad_combo.findData(preferred)
+            self.gamepad_combo.setCurrentIndex(selected if selected >= 0 else 0)
+        else:
+            self.gamepad_combo.addItem("未检测到手柄（点击刷新）", None)
+        self.gamepad_combo.blockSignals(False)
+
+    def set_gamepad_enabled(self, enabled):
+        if not enabled:
+            self.stop_gamepad_control("右扳机控制已停止")
+            return
+        if not (self.connected and self.power_ready) or self.zero_in_progress:
+            self.gamepad_button.setChecked(False)
+            self.action_status.setText("请先连接后端并等待电机上电就绪")
+            return
+        path = self.gamepad_combo.currentData()
+        if not path:
+            self.refresh_gamepads()
+            path = self.gamepad_combo.currentData()
+        if not path:
+            self.gamepad_button.setChecked(False)
+            self.action_status.setText("未检测到手柄，请连接后点击刷新")
+            return
+        try:
+            self.gamepad_fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            self.gamepad_button.setChecked(False)
+            self.action_status.setText(f"无法打开手柄：{exc}")
+            self.append_log(f"! 无法打开手柄 {path}：{exc}")
+            return
+
+        self.cancel_slider_command()
+        self.stop_actions()
+        self.gamepad_enabled = True
+        self.gamepad_trigger_bipolar = None
+        self.gamepad_last_position = None
+        self.trigger_progress.setValue(0)
+        self.trigger_progress.setFormat("扳机按下 0.0%")
+        self.gamepad_timer.start()
+        # Enabling is an explicit takeover. The documented released position
+        # maps to the configured maximum even before the first init event.
+        self.set_command_position(self.position_max, move_slider=True)
+        self.send_move(self.position_max, self.speed_spin.value(), stream=True)
+        self.gamepad_last_position = self.position_max
+        self.action_status.setText("右扳机控制已启用：松开为最大角度，按下后角度线性减小")
+        self.append_log(
+            f"右扳机控制已启用：{path}，轴 {self.gamepad_axis_combo.currentData()}")
+        self.update_ui()
+
+    def stop_gamepad_control(self, status=None, update_status=True):
+        if hasattr(self, "gamepad_timer"):
+            self.gamepad_timer.stop()
+        if self.gamepad_fd is not None:
+            try:
+                os.close(self.gamepad_fd)
+            except OSError:
+                pass
+        was_enabled = self.gamepad_enabled
+        self.gamepad_fd = None
+        self.gamepad_enabled = False
+        self.gamepad_trigger_bipolar = None
+        self.gamepad_last_position = None
+        if hasattr(self, "gamepad_button"):
+            self.gamepad_button.setChecked(False)
+        if hasattr(self, "trigger_progress"):
+            self.trigger_progress.setValue(0)
+            self.trigger_progress.setFormat("扳机按下 0.0%")
+        if status and update_status:
+            self.action_status.setText(status)
+        if was_enabled and update_status:
+            self.update_ui()
+
+    def apply_gamepad_trigger(self, raw_value):
+        if self.gamepad_trigger_bipolar is None:
+            # Xbox-compatible joystick drivers normally report -32767 at
+            # rest. Some clone controllers instead report 0 at rest.
+            self.gamepad_trigger_bipolar = raw_value < -1000
+        if raw_value < -1000:
+            self.gamepad_trigger_bipolar = True
+        if self.gamepad_trigger_bipolar:
+            depth = (raw_value + 32767.0) / 65534.0
+        else:
+            depth = raw_value / 32767.0
+        depth = max(0.0, min(1.0, depth))
+        self.trigger_progress.setValue(round(depth * 1000))
+        self.trigger_progress.setFormat(f"扳机按下 {depth * 100:.1f}%")
+        position = self.position_max - depth * (self.position_max - self.position_min)
+        if (self.gamepad_last_position is not None
+                and abs(position - self.gamepad_last_position) < 0.01):
+            return
+        self.gamepad_last_position = position
+        self.set_command_position(position, move_slider=True)
+        self.send_move(position, self.speed_spin.value(), stream=True)
+
+    def poll_gamepad(self):
+        if not self.gamepad_enabled or self.gamepad_fd is None:
+            return
+        if not (self.connected and self.power_ready) or self.zero_in_progress:
+            self.stop_gamepad_control("电机未就绪，右扳机控制已停止")
+            return
+        latest_value = None
+        try:
+            while True:
+                payload = os.read(self.gamepad_fd, JOYSTICK_EVENT_SIZE * 64)
+                if not payload:
+                    raise OSError(errno.ENODEV, "手柄已断开")
+                complete = len(payload) - len(payload) % JOYSTICK_EVENT_SIZE
+                for offset in range(0, complete, JOYSTICK_EVENT_SIZE):
+                    _stamp, value, event_type, number = struct.unpack_from(
+                        "<IhBB", payload, offset)
+                    event_type &= ~JOYSTICK_EVENT_INIT
+                    if (event_type == JOYSTICK_EVENT_AXIS
+                            and number == self.gamepad_axis_combo.currentData()):
+                        latest_value = value
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                self.append_log(f"! 手柄读取中断：{exc}")
+                self.stop_gamepad_control("手柄已断开，右扳机控制已停止")
+                return
+        if latest_value is not None:
+            self.apply_gamepad_trigger(latest_value)
 
     def toggle_connection(self):
         if self.connected:
@@ -649,6 +841,7 @@ class GripperDemo(QMainWindow):
         self.disconnect_socket()
 
     def disconnect_socket(self):
+        self.stop_gamepad_control(update_status=False)
         self.rx_timer.stop()
         self.status_timer.stop()
         self.slider_timer.stop()
@@ -762,6 +955,7 @@ class GripperDemo(QMainWindow):
                 self.motor_enabling = False
                 self.action_status.setText("电机已上电并保持当前位置")
         elif key == "MOTOR_POWER_OFF_COMPLETE":
+            self.stop_gamepad_control(update_status=False)
             self.power_ready = False
             self.power_requested = False
             self.motor_disabled = False
@@ -783,12 +977,14 @@ class GripperDemo(QMainWindow):
             self.set_command_position(0.0, move_slider=True)
             self.action_status.setText("位置置零完成")
         elif key == "CLAW_ZERO_STARTED":
+            self.stop_gamepad_control(update_status=False)
             self.zero_in_progress = True
             self.action_status.setText("正在执行失能 → 置零 → 重新使能")
         elif key == "CLAW_ZERO_RETRY":
             attempt = parts[1] if len(parts) > 1 else "下一次"
             self.action_status.setText(f"首次反馈尚未稳定，正在自动重试置零（第 {attempt} 次）")
         elif key == "CLAW_DISABLED":
+            self.stop_gamepad_control(update_status=False)
             self.power_ready = False
             self.motor_disabled = True
             self.motor_enabling = False
@@ -856,6 +1052,7 @@ class GripperDemo(QMainWindow):
         if not self.connected:
             return
         if self.power_requested or self.power_ready:
+            self.stop_gamepad_control(update_status=False)
             self.cancel_slider_command()
             self.stop_actions()
             self.send_command("MOTOR_POWER_OFF")
@@ -863,6 +1060,7 @@ class GripperDemo(QMainWindow):
             self.send_command("MOTOR_POWER_ON")
 
     def emergency_stop(self):
+        self.stop_gamepad_control(update_status=False)
         self.slider_pending = None
         self.slider_timer.stop()
         self.stop_actions(send_stop=False)
@@ -872,6 +1070,7 @@ class GripperDemo(QMainWindow):
         self.action_status.setText("已执行急停并下电")
 
     def toggle_motor_enabled(self):
+        self.stop_gamepad_control(update_status=False)
         self.cancel_slider_command()
         if self.motor_disabled:
             if self.send_command("CLAW_ENABLE"):
@@ -891,6 +1090,7 @@ class GripperDemo(QMainWindow):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if answer == QMessageBox.Yes:
+            self.stop_gamepad_control(update_status=False)
             self.slider_pending = None
             self.slider_timer.stop()
             self.stop_actions()
@@ -1248,18 +1448,26 @@ class GripperDemo(QMainWindow):
         controls_ready = (
             self.connected and self.power_ready and not self.zero_in_progress
         )
-        for widget in (self.goto_button, self.gains_button, self.zero_button,
-                       self.start_button):
-            widget.setEnabled(controls_ready)
+        manual_ready = controls_ready and not self.gamepad_enabled
+        for widget in (self.goto_button, self.zero_button, self.start_button):
+            widget.setEnabled(manual_ready)
+        self.gains_button.setEnabled(controls_ready)
         self.disable_button.setEnabled(
             not self.zero_in_progress and self.connected and (
                 self.power_ready or (self.motor_disabled and not self.motor_enabling)
             )
         )
-        self.slider.setEnabled(controls_ready)
+        self.slider.setEnabled(manual_ready)
+        self.target_spin.setEnabled(manual_ready)
         limits_editable = not (self.power_ready or self.power_requested)
         self.position_min_spin.setEnabled(limits_editable)
         self.position_max_spin.setEnabled(limits_editable)
+        self.gamepad_button.setText(
+            "停止右扳机控制" if self.gamepad_enabled else "启用右扳机控制")
+        self.gamepad_button.setEnabled(controls_ready or self.gamepad_enabled)
+        self.gamepad_combo.setEnabled(not self.gamepad_enabled)
+        self.gamepad_axis_combo.setEnabled(not self.gamepad_enabled)
+        self.gamepad_refresh_button.setEnabled(not self.gamepad_enabled)
         self.pause_button.setEnabled(self.action_running)
         self.stop_button.setEnabled(self.action_running or self.action_paused)
 

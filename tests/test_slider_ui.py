@@ -109,6 +109,26 @@ class SliderUiTest(unittest.TestCase):
             isinstance(widget, NoWheelComboBox)
             for widget in self.window.findChildren(QComboBox)))
 
+    def test_trigger_depth_maps_linearly_to_travel_limits(self):
+        self.window.connected = False
+        self.window.position_min_spin.setValue(-20.0)
+        self.window.position_max_spin.setValue(40.0)
+        self.window.apply_position_limits(send_backend=False, announce=False)
+        self.window.connected = True
+        self.window.gamepad_enabled = True
+        self.window.gamepad_trigger_bipolar = True
+        self.window.gamepad_last_position = None
+
+        self.window.apply_gamepad_trigger(-32767)
+        self.assertEqual(self.window.trigger_progress.value(), 0)
+        self.assertTrue(self.commands[-1].startswith("CLAW_STREAM 40.00 "))
+        self.window.apply_gamepad_trigger(0)
+        self.assertEqual(self.window.trigger_progress.value(), 500)
+        self.assertTrue(self.commands[-1].startswith("CLAW_STREAM 10.00 "))
+        self.window.apply_gamepad_trigger(32767)
+        self.assertEqual(self.window.trigger_progress.value(), 1000)
+        self.assertTrue(self.commands[-1].startswith("CLAW_STREAM -20.00 "))
+
 
 if __name__ == "__main__":
     unittest.main()
