@@ -84,6 +84,7 @@ class GripperDemo(QMainWindow):
         self.power_requested = False
         self.motor_disabled = False
         self.motor_enabling = False
+        self.zero_in_progress = False
         self.backend = None
         self.backend_owned = False
         self.connect_deadline = 0.0
@@ -565,6 +566,7 @@ class GripperDemo(QMainWindow):
         self.power_requested = False
         self.motor_disabled = False
         self.motor_enabling = False
+        self.zero_in_progress = False
         self.rx_buffer = b""
         self.append_log("已断开连接")
         for card in (self.position_card, self.velocity_card, self.torque_card,
@@ -641,6 +643,7 @@ class GripperDemo(QMainWindow):
             self.power_requested = True
             self.motor_disabled = False
             self.motor_enabling = False
+            self.zero_in_progress = False
             self.action_status.setText("电机启动中，等待反馈…")
         elif key == "MOTOR_POWER_READY":
             self.power_ready = len(parts) > 1 and parts[1] == "1"
@@ -654,6 +657,7 @@ class GripperDemo(QMainWindow):
             self.power_requested = False
             self.motor_disabled = False
             self.motor_enabling = False
+            self.zero_in_progress = False
             self.stop_actions(send_stop=False)
             self.action_status.setText("电机已下电")
         elif key == "CLAW_MOVE_COMPLETE":
@@ -662,8 +666,18 @@ class GripperDemo(QMainWindow):
             else:
                 self.action_status.setText("已到达目标位置并保持")
         elif key == "CLAW_ZERO_COMPLETE":
+            self.zero_in_progress = False
+            self.power_ready = True
+            self.motor_disabled = False
+            self.motor_enabling = False
             self.set_command_position(0.0, move_slider=True)
             self.action_status.setText("位置置零完成")
+        elif key == "CLAW_ZERO_STARTED":
+            self.zero_in_progress = True
+            self.action_status.setText("正在执行失能 → 置零 → 重新使能")
+        elif key == "CLAW_ZERO_RETRY":
+            attempt = parts[1] if len(parts) > 1 else "下一次"
+            self.action_status.setText(f"首次反馈尚未稳定，正在自动重试置零（第 {attempt} 次）")
         elif key == "CLAW_DISABLED":
             self.power_ready = False
             self.motor_disabled = True
@@ -679,7 +693,19 @@ class GripperDemo(QMainWindow):
         elif key == "GAINS_SET":
             self.action_status.setText(f"Kp/Kd 已应用：{parts[1]} / {parts[2]}")
         elif key == "ERROR":
-            message = self.translate_error(" ".join(parts[1:]))
+            backend_message = " ".join(parts[1:])
+            if backend_message in {
+                "claw zero command failed",
+                "claw zero verification failed",
+                "claw zero feedback timeout",
+            }:
+                self.zero_in_progress = False
+                self.power_ready = False
+                self.motor_disabled = True
+                self.motor_enabling = False
+            elif backend_message == "claw zero requires motor power":
+                self.zero_in_progress = False
+            message = self.translate_error(backend_message)
             self.action_status.setText(f"错误：{message}")
             self.append_log(f"! {message}")
         elif key == "LOG":
@@ -740,15 +766,21 @@ class GripperDemo(QMainWindow):
         self.send_command("CLAW_DISABLE")
 
     def zero_position(self):
+        if self.zero_in_progress:
+            return
         answer = QMessageBox.question(
             self, "确认位置置零",
             "置零会短暂失能电机，并把当前位置设为 0°。确认机械位置安全吗？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if answer == QMessageBox.Yes:
+            self.slider_pending = None
+            self.slider_timer.stop()
             self.stop_actions()
-            self.send_command("CLAW_ZERO")
-            self.action_status.setText("正在执行失能 → 置零 → 重新使能")
+            if self.send_command("CLAW_ZERO"):
+                self.zero_in_progress = True
+                self.action_status.setText("正在执行失能 → 置零 → 重新使能")
+                self.update_ui()
 
     def apply_gains(self):
         self.send_command(f"SET_GAINS {self.kp_spin.value():.2f} {self.kd_spin.value():.2f}")
@@ -1075,15 +1107,18 @@ class GripperDemo(QMainWindow):
         can_change = self.connected and not (self.power_ready or self.power_requested)
         self.can_combo.setEnabled(can_change)
         self.id_combo.setEnabled(can_change)
+        controls_ready = (
+            self.connected and self.power_ready and not self.zero_in_progress
+        )
         for widget in (self.goto_button, self.gains_button, self.zero_button,
                        self.start_button):
-            widget.setEnabled(self.connected and self.power_ready)
+            widget.setEnabled(controls_ready)
         self.disable_button.setEnabled(
-            self.connected and (
+            not self.zero_in_progress and self.connected and (
                 self.power_ready or (self.motor_disabled and not self.motor_enabling)
             )
         )
-        self.slider.setEnabled(self.connected and self.power_ready)
+        self.slider.setEnabled(controls_ready)
         self.pause_button.setEnabled(self.action_running)
         self.stop_button.setEnabled(self.action_running or self.action_paused)
 

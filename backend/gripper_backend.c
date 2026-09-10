@@ -40,6 +40,12 @@
 #define CONTROL_PERIOD_US 2000
 #define TELEMETRY_PERIOD_MS 20LL
 #define MOVE_PEAK_FACTOR 1.875f
+#define ZERO_MAX_ATTEMPTS 3
+#define ZERO_FRAME_REPEAT 3
+#define ZERO_FEEDBACK_TIMEOUT_MS 1000LL
+#define ZERO_POSITION_TOLERANCE_DEG 2.0f
+#define STREAM_POSITION_EPS_DEG 0.01f
+#define STREAM_VELOCITY_EPS_DEG_S 0.1f
 
 typedef struct {
     float position;
@@ -302,11 +308,22 @@ static void update_stream_locked(float dt)
     g_command_velocity += clampf(wanted_velocity - g_command_velocity,
                                  -max_change, max_change);
     float step = g_command_velocity * dt;
-    if (fabsf(step) >= fabsf(error) || fabsf(error) < DEG_TO_RAD(0.01f)) {
+    const int moving_toward_target = step * error > 0.0f;
+    const int would_cross_target =
+        moving_toward_target && fabsf(step) >= fabsf(error);
+    const int settled =
+        fabsf(error) < DEG_TO_RAD(STREAM_POSITION_EPS_DEG) &&
+        fabsf(g_command_velocity) < DEG_TO_RAD(STREAM_VELOCITY_EPS_DEG_S);
+    if (would_cross_target || settled) {
         g_command_position = g_motion.target_position;
         g_command_velocity = 0.0f;
     } else {
-        g_command_position += step;
+        const float next_position = g_command_position + step;
+        g_command_position = clampf(
+            next_position, DEG_TO_RAD(-360.0f), DEG_TO_RAD(360.0f));
+        if (g_command_position != next_position) {
+            g_command_velocity = 0.0f;
+        }
     }
 }
 
@@ -414,9 +431,12 @@ static void stop_and_hold(void)
 
 static void handle_zero(int fd)
 {
-    unsigned int bus, motor_id, old_sequence;
+    unsigned int bus, motor_id;
     int allowed;
+    int feedback_received = 0;
+    int send_failed = 0;
     uint8_t zero_data[8];
+    (void)fd;
     memset(zero_data, 0xFF, sizeof(zero_data));
     zero_data[7] = 0xFE;
 
@@ -424,11 +444,12 @@ static void handle_zero(int fd)
     allowed = g_power_on && g_mode_entered;
     bus = g_bus;
     motor_id = g_motor_id;
-    old_sequence = g_feedback.sequence;
     if (allowed) {
         g_motion.kind = MOTION_IDLE;
+        g_enable_requested = 0;
         g_control_ready = 0;
         g_mode_entered = 0;
+        g_command_velocity = 0.0f;
     }
     pthread_mutex_unlock(&g_state_lock);
     if (!allowed) {
@@ -436,37 +457,55 @@ static void handle_zero(int fd)
         return;
     }
 
-    send_mode(bus, motor_id, 0xFD);
-    usleep(30000);
-    if (send_packet(bus, motor_id, zero_data) < 0) {
-        pthread_mutex_lock(&g_state_lock);
-        g_enable_requested = 0;
-        pthread_mutex_unlock(&g_state_lock);
-        send_line("ERROR claw zero command failed\n");
-        return;
-    }
-    usleep(30000);
-    pthread_mutex_lock(&g_state_lock);
-    old_sequence = g_feedback.sequence;
-    pthread_mutex_unlock(&g_state_lock);
-    send_mode(bus, motor_id, 0xFC);
+    send_line("CLAW_ZERO_STARTED\n");
+    for (int attempt = 1; attempt <= ZERO_MAX_ATTEMPTS; attempt++) {
+        unsigned int old_sequence;
+        int verified = 0;
 
-    const long long deadline = monotonic_ms() + 700;
-    while (monotonic_ms() < deadline) {
-        pthread_mutex_lock(&g_state_lock);
-        const int received = g_feedback.sequence != old_sequence;
-        const float position = g_feedback.position;
-        pthread_mutex_unlock(&g_state_lock);
-        if (received) {
-            if (fabsf(position) > DEG_TO_RAD(2.0f)) {
-                send_mode(bus, motor_id, 0xFD);
-                pthread_mutex_lock(&g_state_lock);
-                g_enable_requested = 0;
-                pthread_mutex_unlock(&g_state_lock);
-                send_line("ERROR claw zero verification failed\n");
-                return;
+        if (send_mode(bus, motor_id, 0xFD) < 0) {
+            send_failed = 1;
+            break;
+        }
+        usleep(80000);
+        for (int repeat = 0; repeat < ZERO_FRAME_REPEAT; repeat++) {
+            if (send_packet(bus, motor_id, zero_data) < 0) {
+                send_failed = 1;
+                break;
             }
+            usleep(20000);
+        }
+        if (send_failed) break;
+        usleep(50000);
+        pthread_mutex_lock(&g_state_lock);
+        old_sequence = g_feedback.sequence;
+        pthread_mutex_unlock(&g_state_lock);
+        if (send_mode(bus, motor_id, 0xFC) < 0) {
+            send_failed = 1;
+            break;
+        }
+
+        const long long deadline = monotonic_ms() + ZERO_FEEDBACK_TIMEOUT_MS;
+        while (monotonic_ms() < deadline) {
+            unsigned int sequence;
+            float position;
             pthread_mutex_lock(&g_state_lock);
+            sequence = g_feedback.sequence;
+            position = g_feedback.position;
+            pthread_mutex_unlock(&g_state_lock);
+            if (sequence != old_sequence) {
+                feedback_received = 1;
+                old_sequence = sequence;
+                if (fabsf(position) <= DEG_TO_RAD(ZERO_POSITION_TOLERANCE_DEG)) {
+                    verified = 1;
+                    break;
+                }
+            }
+            usleep(5000);
+        }
+
+        if (verified) {
+            pthread_mutex_lock(&g_state_lock);
+            g_enable_requested = 1;
             g_mode_entered = 1;
             g_control_ready = 1;
             g_command_position = 0.0f;
@@ -478,14 +517,28 @@ static void handle_zero(int fd)
             log_line("Motor zero completed on CAN%u, ID %u", bus, motor_id);
             return;
         }
-        usleep(5000);
+
+        send_mode(bus, motor_id, 0xFD);
+        if (attempt < ZERO_MAX_ATTEMPTS) {
+            send_line("CLAW_ZERO_RETRY %d\n", attempt + 1);
+            log_line("Zero verification not stable; retrying (%d/%d)",
+                     attempt + 1, ZERO_MAX_ATTEMPTS);
+            usleep(100000);
+        }
     }
-    send_mode(bus, motor_id, 0xFD);
+
     pthread_mutex_lock(&g_state_lock);
     g_enable_requested = 0;
+    g_mode_entered = 0;
+    g_control_ready = 0;
     pthread_mutex_unlock(&g_state_lock);
-    send_line("ERROR claw zero feedback timeout\n");
-    (void)fd;
+    if (send_failed) {
+        send_line("ERROR claw zero command failed\n");
+    } else if (feedback_received) {
+        send_line("ERROR claw zero verification failed\n");
+    } else {
+        send_line("ERROR claw zero feedback timeout\n");
+    }
 }
 
 static void handle_command(int fd, const char *command)
