@@ -24,6 +24,7 @@ static void reset(float position, float velocity)
     g_torque_filter_sequence = 0;
     g_torque_limited = 0;
     memset(&g_feedback, 0, sizeof(g_feedback));
+    memset(&g_motion, 0, sizeof(g_motion));
 }
 
 static void target(float position, float speed)
@@ -102,6 +103,44 @@ int main(void)
     g_feedback.updated_ms = 2000;
     update_torque_filter_locked();
     assert(!torque_limit_blocks_closing_locked(2000));
+
+    /* A completed trajectory still produces PD torque while holding against
+     * an object. Enabling the limit in this state must back the reference off
+     * instead of clearing the supervisor merely because motion is IDLE. */
+    reset(-10.0f, 0.0f);
+    g_torque_limit_enabled = 1;
+    g_torque_limit_nm = 0.5f;
+    g_feedback.valid = 1;
+    g_feedback.position = DEG_TO_RAD(-9.8f);
+    g_feedback.torque = -0.9f;
+    g_feedback.sequence = 1;
+    g_feedback.updated_ms = 2100;
+    update_torque_filter_locked();
+    const float held_start = g_command_position;
+    assert(g_motion.kind == MOTION_IDLE);
+    assert(torque_limit_blocks_closing_locked(2100));
+    update_torque_limited_reference_locked(0.002f);
+    assert(g_command_position > held_start);
+    assert(g_command_velocity > 0.0f);
+    g_feedback.position = g_command_position - DEG_TO_RAD(0.01f);
+    g_feedback.torque = -0.4f;
+    g_feedback.sequence++;
+    g_feedback.updated_ms = 2101;
+    g_filtered_abs_torque = 0.4f;
+    assert(!torque_limit_blocks_closing_locked(2101));
+    assert(g_command_velocity == 0.0f);
+
+    /* A high load must never prevent an explicit opening hold/reference. */
+    reset(-9.0f, 0.0f);
+    g_torque_limit_enabled = 1;
+    g_torque_limit_nm = 0.5f;
+    g_feedback.valid = 1;
+    g_feedback.position = DEG_TO_RAD(-10.0f);
+    g_feedback.torque = -0.9f;
+    g_feedback.sequence = 1;
+    g_feedback.updated_ms = 2150;
+    update_torque_filter_locked();
+    assert(!torque_limit_blocks_closing_locked(2150));
 
     /* Stale torque feedback fails safe for closing motion. */
     reset(0.0f, 0.0f);

@@ -91,7 +91,7 @@ BXI_PCI_DRV_DIR=/opt/bxi/bxi_pci_drv/lib bash scripts/build_backend.sh
 
 如果上电后一直没有进入就绪状态，请检查 CAN 通道、电机 ID、接线、PCI 驱动和电机固件启动状态。
 
-排查问题时，先确认连接日志中出现 `backend torque-limit-live-v5`，用于确认连接到新后端。
+排查问题时，先确认连接日志中出现 `backend torque-limit-hold-v6`，用于确认连接到新后端。
 重新编译不会替换已运行的后端进程；如日志仍是旧版本，需在下电后退出旧后端并重新启动软件。
 复现异常后可点击“放大日志 → 导出运动诊断 CSV”。其中 `command_*` 是后端生成的控制参考，
 不代表已确认电机执行；`feedback_*` 是选中电机的返回数据，`feedback_age_ms=-1` 表示反馈无效。

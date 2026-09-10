@@ -404,11 +404,11 @@ class GripperDemo(QMainWindow):
                 background: transparent; image: url({checkmark_path});
             }}
         """)
-        self.torque_limit_check.toggled.connect(self.update_torque_limit_checkbox_text)
         self.torque_limit_spin = self.spin(0.05, 40.0, 1.0, 0.05, " N·m", 2)
         self.torque_limit_spin.setToolTip("反馈力矩达到该值后停止继续夹紧")
-        self.torque_limit_button = QPushButton("应用限力")
+        self.torque_limit_button = QPushButton("应用限力值")
         self.torque_limit_button.clicked.connect(lambda: self.apply_torque_limit())
+        self.torque_limit_check.toggled.connect(self.torque_limit_toggled)
         gamepad_layout.addWidget(self.torque_limit_check, 5, 0)
         gamepad_layout.addWidget(self.torque_limit_spin, 5, 1)
         gamepad_layout.addWidget(self.torque_limit_button, 5, 2)
@@ -600,8 +600,8 @@ class GripperDemo(QMainWindow):
             torque_limit_nm = 1.0
         self.torque_limit_enabled = torque_limit_enabled
         self.torque_limit_nm = max(0.05, min(40.0, torque_limit_nm))
-        self.torque_limit_check.setChecked(self.torque_limit_enabled)
         self.torque_limit_spin.setValue(self.torque_limit_nm)
+        self.torque_limit_check.setChecked(self.torque_limit_enabled)
         self.update_torque_limit_progress(0.0, False)
         trigger_axis = int(self.settings.value("gamepad_trigger_axis", DEFAULT_TRIGGER_AXIS))
         axis_index = self.gamepad_axis_combo.findData(trigger_axis)
@@ -673,14 +673,19 @@ class GripperDemo(QMainWindow):
         if announce:
             if self.torque_limit_enabled:
                 self.action_status.setText(
-                    f"软件夹持力矩上限已设为 {self.torque_limit_nm:.2f} N·m")
+                    f"限力值已改为 {self.torque_limit_nm:.2f} N·m")
             else:
-                self.action_status.setText("软件夹持力矩限制已关闭")
+                self.action_status.setText(
+                    f"限力值已改为 {self.torque_limit_nm:.2f} N·m（当前未启用）")
         return True
 
-    def update_torque_limit_checkbox_text(self, checked):
-        self.torque_limit_check.setText(
-            "✓ 软件限力已勾选" if checked else "启用软件限力")
+    def torque_limit_toggled(self, checked):
+        self.apply_torque_limit(announce=False)
+        if checked:
+            self.action_status.setText(
+                f"软件限力已启用：{self.torque_limit_nm:.2f} N·m")
+        else:
+            self.action_status.setText("软件限力已关闭")
 
     def update_torque_limit_progress(self, filtered_torque, active):
         if not self.torque_limit_enabled:

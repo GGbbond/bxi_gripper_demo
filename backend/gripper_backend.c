@@ -53,7 +53,7 @@
 #define TORQUE_BACKOFF_MIN_DEG_S 0.5f
 #define TORQUE_BACKOFF_GAIN_DEG_S_PER_NM 5.0f
 #define TORQUE_BACKOFF_MAX_DEG_S 10.0f
-#define BACKEND_REVISION "torque-limit-live-v5"
+#define BACKEND_REVISION "torque-limit-hold-v6"
 
 typedef struct {
     float position;
@@ -370,22 +370,35 @@ static void restart_move_from_reference_locked(long long now_ms)
 
 static int torque_limit_blocks_closing_locked(long long now_ms)
 {
-    if (!g_torque_limit_enabled || g_motion.kind == MOTION_IDLE) {
+    if (!g_torque_limit_enabled) {
         g_torque_limited = 0;
         return 0;
     }
 
-    /* Decreasing angle closes this gripper. Never block an opening command:
-     * the operator must be able to release the load while torque is high. */
-    const int closing =
-        g_motion.target_position < g_command_position - DEG_TO_RAD(0.001f);
+    const int feedback_fresh =
+        g_feedback.valid &&
+        now_ms - g_feedback.updated_ms <= TORQUE_FEEDBACK_TIMEOUT_MS;
+    /* Decreasing angle closes this gripper. During a trajectory, compare the
+     * requested target with the measured position. During position hold, the
+     * position controller can still be pushing against an object after the
+     * trajectory has completed, so compare p_des with measured position too.
+     * This keeps force supervision alive at the end of a move and also makes
+     * enabling the limit while already gripping take effect immediately. */
+    const float closing_reference = g_motion.kind == MOTION_IDLE
+        ? g_command_position : g_motion.target_position;
+    const int closing = feedback_fresh
+        ? closing_reference < g_feedback.position - DEG_TO_RAD(0.001f)
+        : (g_motion.kind != MOTION_IDLE &&
+           g_motion.target_position < g_command_position - DEG_TO_RAD(0.001f));
     if (!closing) {
+        if (g_torque_limited && g_motion.kind == MOTION_IDLE) {
+            g_command_velocity = 0.0f;
+        }
         g_torque_limited = 0;
         return 0;
     }
 
-    const int feedback_stale =
-        !g_feedback.valid || now_ms - g_feedback.updated_ms > TORQUE_FEEDBACK_TIMEOUT_MS;
+    const int feedback_stale = !feedback_fresh;
     const float raw_abs_torque = fabsf(g_feedback.torque);
     if (feedback_stale || (!g_torque_limited &&
             (raw_abs_torque >= g_torque_limit_nm ||
@@ -396,6 +409,7 @@ static int torque_limit_blocks_closing_locked(long long now_ms)
                g_filtered_abs_torque <= g_torque_limit_nm * TORQUE_LIMIT_RELEASE_RATIO) {
         g_torque_limited = 0;
         restart_move_from_reference_locked(now_ms);
+        if (g_motion.kind == MOTION_IDLE) g_command_velocity = 0.0f;
     }
     return g_torque_limited;
 }
@@ -454,16 +468,14 @@ static void *control_loop(void *arg)
             send_enter = 1;
         }
         if (g_power_on && g_mode_entered && g_control_ready) {
-            int torque_blocked = 0;
             update_torque_filter_locked();
-            if (g_motion.kind == MOTION_MOVE) {
-                torque_blocked = torque_limit_blocks_closing_locked(now);
-                if (torque_blocked) update_torque_limited_reference_locked(dt);
-                else update_move_locked(now, &completed);
+            const int torque_blocked = torque_limit_blocks_closing_locked(now);
+            if (torque_blocked) {
+                update_torque_limited_reference_locked(dt);
+            } else if (g_motion.kind == MOTION_MOVE) {
+                update_move_locked(now, &completed);
             } else if (g_motion.kind == MOTION_STREAM) {
-                torque_blocked = torque_limit_blocks_closing_locked(now);
-                if (torque_blocked) update_torque_limited_reference_locked(dt);
-                else update_stream_locked(dt);
+                update_stream_locked(dt);
             } else {
                 g_torque_limited = 0;
             }
@@ -737,6 +749,13 @@ static void handle_command(int fd, const char *command)
             return;
         }
         pthread_mutex_lock(&g_state_lock);
+        if (!value && g_torque_limited) {
+            /* A paused timed move may already be past its original end time.
+             * Restart it from the current safe reference so disabling the
+             * limit cannot create a one-cycle jump to the final target. */
+            restart_move_from_reference_locked(monotonic_ms());
+            if (g_motion.kind == MOTION_IDLE) g_command_velocity = 0.0f;
+        }
         g_torque_limit_enabled = (int)value;
         g_torque_limit_nm = position;
         reset_torque_supervisor_locked();

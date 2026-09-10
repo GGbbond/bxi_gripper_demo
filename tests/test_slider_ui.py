@@ -97,7 +97,15 @@ class SliderUiTest(unittest.TestCase):
         self.window.power_requested = True
         self.window.update_ui()
         self.assertTrue(self.window.torque_limit_button.isEnabled())
+        self.window.torque_limit_check.blockSignals(True)
+        self.window.torque_limit_check.setChecked(False)
+        self.window.torque_limit_check.blockSignals(False)
+        self.window.torque_limit_enabled = False
+        self.commands.clear()
+        self.window.torque_limit_spin.setValue(0.75)
         self.window.torque_limit_check.setChecked(True)
+        self.assertEqual(self.commands[-1], "SET_TORQUE_LIMIT 1 0.75")
+        self.assertEqual(self.window.torque_limit_check.text(), "启用软件限力")
         self.window.torque_limit_spin.setValue(1.25)
         self.assertTrue(self.window.apply_torque_limit())
         self.assertEqual(self.commands[-1], "SET_TORQUE_LIMIT 1 1.25")
@@ -107,6 +115,7 @@ class SliderUiTest(unittest.TestCase):
         self.assertIn("限力中", self.window.torque_limit_progress.format())
         # Periodic backend status must not undo an in-progress UI edit.
         self.window.torque_limit_check.setChecked(False)
+        self.assertEqual(self.commands[-1], "SET_TORQUE_LIMIT 0 1.25")
         self.window.torque_limit_spin.setValue(0.50)
         self.window.handle_line("TORQUE_LIMIT_STATUS 1 1.10 1.25 1")
         self.assertFalse(self.window.torque_limit_check.isChecked())
