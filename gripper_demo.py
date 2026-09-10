@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -81,6 +82,8 @@ class GripperDemo(QMainWindow):
         self.connected = False
         self.power_ready = False
         self.power_requested = False
+        self.motor_disabled = False
+        self.motor_enabling = False
         self.backend = None
         self.backend_owned = False
         self.connect_deadline = 0.0
@@ -91,6 +94,8 @@ class GripperDemo(QMainWindow):
         self.action_paused = False
         self.action_index = 0
         self.action_points = []
+        self.log_dialog = None
+        self.log_dialog_output = None
         self.action_wait_timer = QTimer(self)
         self.action_wait_timer.setSingleShot(True)
         self.action_wait_timer.timeout.connect(self.advance_action)
@@ -186,7 +191,6 @@ class GripperDemo(QMainWindow):
         splitter.addWidget(self.build_control_panel())
         splitter.addWidget(self.build_program_panel())
         splitter.setSizes([500, 600])
-        root_layout.addWidget(splitter, 1)
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -194,9 +198,25 @@ class GripperDemo(QMainWindow):
         log_group = QGroupBox("运行日志")
         log_layout = QVBoxLayout(log_group)
         log_layout.setContentsMargins(7, 9, 7, 7)
-        log_layout.addWidget(self.log)
-        log_group.setMaximumHeight(145)
-        root_layout.addWidget(log_group)
+        log_content = QHBoxLayout()
+        expand_log_button = QPushButton("放大日志")
+        expand_log_button.setToolTip("在独立窗口中查看完整运行日志")
+        expand_log_button.clicked.connect(self.show_log_dialog)
+        expand_log_button.setMaximumWidth(100)
+        log_content.addWidget(self.log, 1)
+        log_content.addWidget(expand_log_button)
+        log_layout.addLayout(log_content)
+        log_group.setMinimumHeight(75)
+
+        vertical_splitter = QSplitter(Qt.Vertical)
+        vertical_splitter.setChildrenCollapsible(False)
+        vertical_splitter.addWidget(splitter)
+        vertical_splitter.addWidget(log_group)
+        vertical_splitter.setStretchFactor(0, 1)
+        vertical_splitter.setStretchFactor(1, 0)
+        vertical_splitter.setSizes([525, 95])
+        vertical_splitter.setToolTip("拖动分隔线可调整运行日志区域大小")
+        root_layout.addWidget(vertical_splitter, 1)
 
     def build_control_panel(self):
         panel = QWidget()
@@ -268,7 +288,7 @@ class GripperDemo(QMainWindow):
         self.zero_button = QPushButton("位置置零")
         self.zero_button.clicked.connect(self.zero_position)
         self.disable_button = QPushButton("电机失能")
-        self.disable_button.clicked.connect(self.disable_motor)
+        self.disable_button.clicked.connect(self.toggle_motor_enabled)
         buttons.addWidget(self.goto_button)
         buttons.addWidget(self.gains_button)
         buttons.addWidget(self.zero_button)
@@ -358,9 +378,59 @@ class GripperDemo(QMainWindow):
 
     def append_log(self, text):
         stamp = time.strftime("%H:%M:%S")
-        self.log.appendPlainText(f"[{stamp}] {text}")
-        bar = self.log.verticalScrollBar()
+        message = f"[{stamp}] {text}"
+        self.log.appendPlainText(message)
+        self.scroll_log_to_bottom(self.log)
+        if self.log_dialog_output:
+            self.log_dialog_output.appendPlainText(message)
+            self.scroll_log_to_bottom(self.log_dialog_output)
+
+    @staticmethod
+    def scroll_log_to_bottom(output):
+        bar = output.verticalScrollBar()
         bar.setValue(bar.maximum())
+
+    def clear_logs(self):
+        self.log.clear()
+        if self.log_dialog_output:
+            self.log_dialog_output.clear()
+
+    def show_log_dialog(self):
+        if self.log_dialog and self.log_dialog.isVisible():
+            self.log_dialog.showNormal()
+            self.log_dialog.raise_()
+            self.log_dialog.activateWindow()
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("BXI 夹爪控制演示 - 运行日志")
+        dialog.resize(1080, 720)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        layout = QVBoxLayout(dialog)
+        output = QPlainTextEdit()
+        output.setReadOnly(True)
+        output.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        output.document().setMaximumBlockCount(4000)
+        output.setPlainText(self.log.toPlainText())
+        self.scroll_log_to_bottom(output)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        clear_button = QPushButton("清空日志")
+        close_button = QPushButton("关闭")
+        clear_button.clicked.connect(self.clear_logs)
+        close_button.clicked.connect(dialog.close)
+        buttons.addWidget(clear_button)
+        buttons.addWidget(close_button)
+        layout.addWidget(output, 1)
+        layout.addLayout(buttons)
+        self.log_dialog = dialog
+        self.log_dialog_output = output
+        dialog.finished.connect(self.log_dialog_closed)
+        dialog.show()
+
+    def log_dialog_closed(self, _result=None):
+        self.log_dialog = None
+        self.log_dialog_output = None
 
     def load_settings(self):
         can_bus = int(self.settings.value("can_bus", 2))
@@ -493,6 +563,8 @@ class GripperDemo(QMainWindow):
         self.connected = False
         self.power_ready = False
         self.power_requested = False
+        self.motor_disabled = False
+        self.motor_enabling = False
         self.rx_buffer = b""
         self.append_log("已断开连接")
         for card in (self.position_card, self.velocity_card, self.torque_card,
@@ -567,15 +639,21 @@ class GripperDemo(QMainWindow):
 
         if key == "MOTOR_POWERING_ON":
             self.power_requested = True
+            self.motor_disabled = False
+            self.motor_enabling = False
             self.action_status.setText("电机启动中，等待反馈…")
         elif key == "MOTOR_POWER_READY":
             self.power_ready = len(parts) > 1 and parts[1] == "1"
             self.power_requested = self.power_ready or self.power_requested
             if self.power_ready:
+                self.motor_disabled = False
+                self.motor_enabling = False
                 self.action_status.setText("电机已上电并保持当前位置")
         elif key == "MOTOR_POWER_OFF_COMPLETE":
             self.power_ready = False
             self.power_requested = False
+            self.motor_disabled = False
+            self.motor_enabling = False
             self.stop_actions(send_stop=False)
             self.action_status.setText("电机已下电")
         elif key == "CLAW_MOVE_COMPLETE":
@@ -588,8 +666,14 @@ class GripperDemo(QMainWindow):
             self.action_status.setText("位置置零完成")
         elif key == "CLAW_DISABLED":
             self.power_ready = False
+            self.motor_disabled = True
+            self.motor_enabling = False
             self.stop_actions(send_stop=False)
             self.action_status.setText("电机已失能；硬件电源仍开启")
+        elif key == "CLAW_ENABLING":
+            self.motor_disabled = True
+            self.motor_enabling = True
+            self.action_status.setText("正在重新使能，等待电机反馈…")
         elif key == "CLAW_HOLDING":
             self.action_status.setText("已停止，保持当前位置")
         elif key == "GAINS_SET":
@@ -609,6 +693,7 @@ class GripperDemo(QMainWindow):
         return {
             "motor is not ready": "电机尚未准备好",
             "claw zero requires motor power": "请先给夹爪电机上电",
+            "claw enable requires motor power": "硬件电源未开启，无法使能电机",
             "claw zero command failed": "置零报文发送失败",
             "claw zero verification failed": "置零后位置反馈超出允许范围，电机已失能",
             "claw zero feedback timeout": "置零后未收到反馈，电机已失能",
@@ -644,7 +729,13 @@ class GripperDemo(QMainWindow):
             self.send_command("MOTOR_POWER_OFF")
         self.action_status.setText("已执行急停并下电")
 
-    def disable_motor(self):
+    def toggle_motor_enabled(self):
+        if self.motor_disabled:
+            if self.send_command("CLAW_ENABLE"):
+                self.motor_enabling = True
+                self.action_status.setText("正在重新使能，等待电机反馈…")
+                self.update_ui()
+            return
         self.stop_actions(send_stop=False)
         self.send_command("CLAW_DISABLE")
 
@@ -974,14 +1065,24 @@ class GripperDemo(QMainWindow):
         self.connect_button.setText("断开连接" if self.connected else "启动并连接")
         self.power_button.setText("夹爪电机下电" if (self.power_ready or self.power_requested)
                                   else "夹爪电机上电")
+        self.disable_button.setText(
+            "使能中…" if self.motor_enabling
+            else "重新使能" if self.motor_disabled
+            else "电机失能"
+        )
         self.power_button.setEnabled(self.connected)
         self.emergency_button.setEnabled(self.connected)
         can_change = self.connected and not (self.power_ready or self.power_requested)
         self.can_combo.setEnabled(can_change)
         self.id_combo.setEnabled(can_change)
         for widget in (self.goto_button, self.gains_button, self.zero_button,
-                       self.disable_button, self.start_button):
+                       self.start_button):
             widget.setEnabled(self.connected and self.power_ready)
+        self.disable_button.setEnabled(
+            self.connected and (
+                self.power_ready or (self.motor_disabled and not self.motor_enabling)
+            )
+        )
         self.slider.setEnabled(self.connected and self.power_ready)
         self.pause_button.setEnabled(self.action_running)
         self.stop_button.setEnabled(self.action_running or self.action_paused)

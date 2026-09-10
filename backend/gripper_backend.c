@@ -598,6 +598,23 @@ static void handle_command(int fd, const char *command)
         send_line("CLAW_DISABLED\n");
         return;
     }
+    if (strcmp(command, "CLAW_ENABLE") == 0) {
+        pthread_mutex_lock(&g_state_lock);
+        if (!g_power_on) {
+            pthread_mutex_unlock(&g_state_lock);
+            send_line("ERROR claw enable requires motor power\n");
+            return;
+        }
+        g_motion.kind = MOTION_IDLE;
+        g_command_velocity = 0.0f;
+        g_control_ready = 0;
+        g_mode_entered = 0;
+        g_enable_requested = 1;
+        pthread_mutex_unlock(&g_state_lock);
+        send_line("CLAW_ENABLING\n");
+        log_line("Re-enabling claw motor without cycling hardware power");
+        return;
+    }
     if (strcmp(command, "CLAW_ZERO") == 0) {
         handle_zero(fd);
         return;
