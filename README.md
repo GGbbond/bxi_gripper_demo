@@ -186,59 +186,234 @@ jstest /dev/input/js0
 5. 勾选“循环播放”后，最后一点完成会以“回起点速度”返回第一点并继续循环。
 6. 使用“导出动作程序”保存为 JSON，在同一坐标零点和活动范围下可再次导入。
 
-## 5. 典型夹爪控制示例
+## 5. 程序实现与夹爪控制示例
 
-以下数值仅用于说明操作逻辑，不能直接视为客户机构的安全参数。示例假设已经标定为 `0°` 接近闭合、`120°` 为张开，并且角度减小表示夹紧。
+本节面向需要阅读源码或把夹爪控制集成到自己上位机的开发人员。示例展示的是程序控制链路和实现方法，不是界面操作步骤。
 
-### 示例 A：手动低速夹取
+### 5.1 软件架构
 
-1. 下电状态设置活动范围为 `0°–120°`。
-2. 上电并等待反馈就绪，先以 `20 deg/s` 前往 `110°`，确认增大角度确实松开。
-3. 设置限力值 `0.50 N·m`，点击“应用限力值”，再勾选“启用软件限力”。
-4. 将目标位置设为 `20°`，峰值速度设为 `10 deg/s`，点击“前往位置”。
-5. 接触物体后观察反馈扭矩和限力进度条。显示“限力中”时，软件会停止继续夹紧并按需小幅回退。
-6. 释放物体时前往 `110°`。松开方向不会被软件限力阻断。
-
-### 示例 B：右扳机比例开合
-
-活动范围仍为 `0°–120°` 时：
-
-| 扳机深度 | 目标角度 | 状态示意 |
-| ---: | ---: | --- |
-| 0% | 120° | 最大张开 |
-| 25% | 90° | 轻微闭合 |
-| 50% | 60° | 半行程 |
-| 75% | 30° | 接近闭合 |
-| 100% | 0° | 最小角度 |
-
-实际夹取时不要把机械极限直接设为活动范围端点，应预留余量并配合软件限力。
-
-### 示例 C：开合演示动作
-
-可创建三个动作点：
-
-| 动作点 | 位置 | 峰值速度 | 到达后等待 | 说明 |
-| --- | ---: | ---: | ---: | --- |
-| 1 | 120° | 起点 | 1.0 s | 张开等待 |
-| 2 | 20° | 40 deg/s | 1.0 s | 夹紧并停留 |
-| 3 | 120° | 60 deg/s | 1.0 s | 松开并停留 |
-
-对应的导出文件示例：
-
-```json
-{
-  "format": "bxi-gripper-action",
-  "version": 1,
-  "points": [
-    {"position": 120.0, "speed": 60.0, "duration": 0.0, "wait": 1.0, "mode": "speed"},
-    {"position": 20.0, "speed": 40.0, "duration": 4.6875, "wait": 1.0, "mode": "speed"},
-    {"position": 120.0, "speed": 60.0, "duration": 3.125, "wait": 1.0, "mode": "speed"}
-  ],
-  "return_speed": 60.0
-}
+```text
+gripper_demo.py（PyQt5 客户端）
+  ├─ 手动位置、滑块、动作表、手柄输入
+  ├─ 20 ms 输入采样和状态接收
+  └─ TCP 文本命令（127.0.0.1:9999）
+                    │
+                    ▼
+gripper_backend.c（单客户端硬件后端）
+  ├─ 命令校验与状态机
+  ├─ 五次 S 曲线 / 连续目标跟随
+  ├─ 软件力矩监控
+  ├─ 2 ms MIT 控制周期
+  └─ BXI PCI 用户态驱动
+                    │
+                    ▼
+           CAN FD 电机控制与反馈
 ```
 
-动作文件保存的是电机坐标。更换夹爪、重新置零或改变传动结构后，必须重新检查每个动作点，不能直接循环运行。
+界面不直接按鼠标事件发送 CAN 帧，而是把目标传给后端。后端以固定控制周期持续生成一致的 `p_des` 和 `v_des`，再打包成 MIT 控制帧。这样即使界面短时卡顿，CAN 控制周期也不会跟着界面刷新率变化。
+
+后端目前只监听本机回环地址并只服务一个客户端。自定义程序与图形界面不能同时控制同一个后端实例。
+
+主要源码入口是 [`gripper_demo.py`](gripper_demo.py) 和 [`backend/gripper_backend.c`](backend/gripper_backend.c)。当前 TCP 接口用于本 Demo 的本机进程通信；客户产品若长期依赖该接口，应锁定协议版本，并为命令、响应和兼容性增加独立测试。
+
+### 5.2 本机 TCP 控制协议
+
+客户端连接 `127.0.0.1:9999` 后应先等待：
+
+```text
+HELLO BXI_GRIPPER_DEMO 1
+```
+
+每条命令必须以换行符 `\n` 结束。常用命令如下：
+
+| 命令 | 说明 | 关键前提 |
+| --- | --- | --- |
+| `SET_CLAW_CAN <0..6>` | 选择 CAN 通道 | 必须下电 |
+| `SET_MOTOR_ID <0..8>` | 选择电机 ID | 必须下电 |
+| `SET_POSITION_LIMITS <min> <max>` | 设置软件位置范围，单位 deg | 必须下电；`min ≤ 0 ≤ max` 且 `min < max` |
+| `SET_GAINS <kp> <kd>` | 设置 MIT 位置增益 | `0≤Kp≤500`，`0≤Kd≤5` |
+| `SET_TORQUE_LIMIT <0或1> <Nm>` | 关闭/启用并更新软件限力 | 可在上电时修改；范围 `0.05–40` |
+| `MOTOR_POWER_ON` | 打开电机硬件电源并请求进入 MIT 模式 | 必须继续等待就绪反馈 |
+| `MOTOR_POWER_STATUS` | 查询控制是否就绪 | 返回 `MOTOR_POWER_READY 0/1` |
+| `CLAW_MOVE <pos> <speed> <kp> <kd>` | 五次 S 曲线点到点运动 | 电机已就绪且目标在活动范围内 |
+| `CLAW_STREAM <pos> <speed> <kp> <kd>` | 更新连续跟随目标 | 用于滑块、手柄等连续输入 |
+| `CLAW_STOP` | 停止当前轨迹并保持反馈位置 | 电机仍保持使能 |
+| `CLAW_ZERO` | 当前位置置零并自动重新使能 | 电机已上电；机械位置安全 |
+| `CLAW_DISABLE` / `CLAW_ENABLE` | 失能/重新使能电机 | `CLAW_ENABLE` 要求硬件电源仍开 |
+| `MOTOR_POWER_OFF` | 退出控制模式并关闭电机电源 | 推荐在客户端退出前执行 |
+| `SHUTDOWN` | 终止后端进程 | 仅由拥有后端生命周期的客户端使用 |
+
+后端会异步发送 `POS`、`VEL`、`TORQUE`、温度、`TRACE` 和 `TORQUE_LIMIT_STATUS`。TCP 是字节流，一次 `recv()` 可能得到半行或多行；集成程序必须缓存数据并按 `\n` 拆行，不能假设一次接收等于一条消息。
+
+### 5.3 Python 控制示例
+
+先在一个终端独立启动后端：
+
+```bash
+sudo ./build/bin/gripper_backend
+```
+
+下面代码展示正确的连接、配置、上电等待和运动命令顺序。示例位置仅用于说明，实际运行前必须替换为经过验证的安全参数。
+
+```python
+import socket
+import time
+
+
+class GripperClient:
+    def __init__(self, host="127.0.0.1", port=9999):
+        self.sock = socket.create_connection((host, port), timeout=3.0)
+        self.stream = self.sock.makefile("r", encoding="utf-8", newline="\n")
+        self.wait_for("HELLO BXI_GRIPPER_DEMO 1", timeout=3.0)
+
+    def send(self, command):
+        self.sock.sendall((command + "\n").encode("utf-8"))
+
+    def wait_for(self, prefix, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.sock.settimeout(max(0.1, deadline - time.monotonic()))
+            line = self.stream.readline()
+            if not line:
+                raise ConnectionError("后端连接已关闭")
+            line = line.strip()
+            if line.startswith("ERROR "):
+                raise RuntimeError(line)
+            if line.startswith(prefix):
+                return line
+        raise TimeoutError(f"等待 {prefix} 超时")
+
+    def configure(self, can_bus, motor_id, position_min, position_max,
+                  kp, kd, torque_limit_nm):
+        self.send(f"SET_CLAW_CAN {can_bus}")
+        self.wait_for("CLAW_CAN_SET")
+        self.send(f"SET_MOTOR_ID {motor_id}")
+        self.wait_for("MOTOR_ID_SET")
+        self.send(f"SET_POSITION_LIMITS {position_min} {position_max}")
+        self.wait_for("POSITION_LIMITS_SET")
+        self.send(f"SET_GAINS {kp} {kd}")
+        self.wait_for("GAINS_SET")
+        self.send(f"SET_TORQUE_LIMIT 1 {torque_limit_nm}")
+        self.wait_for("TORQUE_LIMIT_SET")
+
+    def power_on(self):
+        self.send("MOTOR_POWER_ON")
+        self.wait_for("MOTOR_POWERING_ON")
+        # 不能在 MOTOR_POWERING_ON 后立即运动；必须等电机返回有效反馈。
+        while True:
+            self.send("MOTOR_POWER_STATUS")
+            if self.wait_for("MOTOR_POWER_READY", timeout=2.0).endswith(" 1"):
+                return
+            time.sleep(0.2)
+
+    def move(self, position_deg, speed_deg_s, kp, kd):
+        self.send(f"CLAW_MOVE {position_deg} {speed_deg_s} {kp} {kd}")
+        self.wait_for("CLAW_MOVE_STARTED")
+
+    def stream_target(self, position_deg, speed_deg_s, kp, kd):
+        self.send(f"CLAW_STREAM {position_deg} {speed_deg_s} {kp} {kd}")
+
+    def stop(self):
+        self.send("CLAW_STOP")
+        self.wait_for("CLAW_HOLDING")
+
+    def power_off(self):
+        self.send("MOTOR_POWER_OFF")
+        self.wait_for("MOTOR_POWER_OFF_COMPLETE")
+
+
+gripper = GripperClient()
+try:
+    # 示例假设 0° 接近闭合、120° 为张开，减小角度表示夹紧。
+    gripper.configure(
+        can_bus=2,
+        motor_id=1,
+        position_min=0.0,
+        position_max=120.0,
+        kp=300.0,
+        kd=5.0,
+        torque_limit_nm=0.50,
+    )
+    gripper.power_on()
+
+    input("确认运动区域安全后按 Enter，夹爪将低速张开：")
+    gripper.move(position_deg=110.0, speed_deg_s=20.0, kp=300.0, kd=5.0)
+    gripper.wait_for("CLAW_MOVE_COMPLETE", timeout=15.0)
+
+    input("确认可以夹取后按 Enter，夹爪将向小角度运动：")
+    gripper.move(position_deg=20.0, speed_deg_s=10.0, kp=300.0, kd=5.0)
+    # 接触物体且限力持续介入时，运动可能不会返回 MOVE_COMPLETE。
+    # 实际应用应同时解析 TORQUE_LIMIT_STATUS，并提供取消/松开操作。
+    time.sleep(3.0)
+
+    # 增大角度为松开方向，限力不会阻断该命令。
+    gripper.move(position_deg=110.0, speed_deg_s=20.0, kp=300.0, kd=5.0)
+    gripper.wait_for("CLAW_MOVE_COMPLETE", timeout=15.0)
+finally:
+    # 生产程序还应处理 SIGINT、进程异常和通信中断。
+    try:
+        gripper.power_off()
+    finally:
+        gripper.sock.close()
+```
+
+该代码用于解释协议调用顺序，不是对任意机构都安全的即插即用参数。正式集成时应把接收处理放到独立线程或事件循环中，持续维护最新反馈、连接状态和急停状态。
+
+### 5.4 点到点与连续目标的实现
+
+`CLAW_MOVE` 适合明确终点的单次运动。后端不会把最终位置一步写入电机，而是生成五次多项式轨迹，使起止速度连续。代码位于 `update_move_locked()`，段时间按距离和峰值速度计算。
+
+`CLAW_STREAM` 适合滑块、摇杆、扳机或网络遥操作。上位机可以约每 20 ms 更新目标，但后端不会在每个新目标到来时把速度清零。`update_stream_locked()` 使用临界阻尼跟随器，并限制速度变化量，再用梯形积分同步更新位置和速度参考。这一点用于避免连续拖动时出现“追目标—突然归零—再次加速”的顿挫。
+
+右扳机的程序映射为：
+
+```python
+depth = (raw_axis + 32767) / 65534       # 双极轴 -32767..32767
+depth = max(0.0, min(1.0, depth))
+target = position_max - depth * (position_max - position_min)
+send(f"CLAW_STREAM {target} {speed} {kp} {kd}")
+```
+
+部分手柄扳机上报 `0..32767`，因此实际代码会在启用时判断轴是单极还是双极。新设备应先用 `jstest` 验证轴号、松开值和按下值，再决定归一化公式。
+
+### 5.5 MIT 控制帧与限力实现
+
+后端发送的 MIT 控制量为：
+
+```text
+p_des, v_des, Kp, Kd, t_ff
+```
+
+本 Demo 的 `t_ff` 固定为 `0`，夹持扭矩来自电机内部的位置/速度 PD 控制。`pack_control()` 将参数压缩到 8 字节 CAN FD 数据区；当前编码量程为位置 `±12.5 rad`、速度 `±45 rad/s`、Kp `0..500`、Kd `0..5`、力矩字段 `±40 N·m`。
+
+`±40 N·m` 是协议字段的编码量程，**不是电机输出扭矩的硬限制**。仅仅把 `t_ff` 设为 0 或改变编码量程，不能限制 Kp/Kd 产生的电机扭矩。
+
+软件限力的程序逻辑是：
+
+1. 每个 2 ms 控制周期更新一次反馈扭矩绝对值滤波。
+2. 用目标/命令位置和反馈位置判断当前是否仍在向小角度夹紧。
+3. 原始或滤波扭矩达到上限后冻结夹紧轨迹。
+4. 超过上限 105% 时逐步增大命令角度，减小位置误差和 PD 扭矩。
+5. 原始值与滤波值都低于上限 90% 后恢复轨迹。
+6. 保持状态仍继续监控；显式松开目标始终放行。
+
+相关实现位于 `update_torque_filter_locked()`、`torque_limit_blocks_closing_locked()` 和 `update_torque_limited_reference_locked()`。
+
+### 5.6 二次开发的控制注意事项
+
+- **必须等待真实反馈就绪。** `MOTOR_POWERING_ON` 只表示电源流程开始；收到 `MOTOR_POWER_READY 1` 后才能发送运动命令。后端首次进入 MIT 模式时会用反馈位置初始化 `p_des`，避免使能瞬间跳到旧目标。
+- **不要直接跳变位置参考。** 点到点运动使用 S 曲线；连续输入使用 `CLAW_STREAM`。如果自己改写后端，也必须保证 `p_des`、`v_des` 和时间步一致，并限制速度与加速度。
+- **不要在每次连续目标更新时清零速度。** 这会在慢拖、反向和靠近目标时产生重复加减速，严重时形成位置突变。
+- **位置范围必须在后端再次校验。** 不能只依赖界面控件；动作文件、网络输入和手柄映射都必须经过同一范围检查。
+- **置零期间必须清空旧目标。** 置零前停止连续输入和动作队列；置零后等待新反馈，再从新坐标生成目标，不能继续发送旧坐标系中的缓存命令。
+- **反馈必须带时效判断。** 不要拿最后一次旧扭矩或旧位置无限期参与控制。本后端在夹紧时超过 100 ms 没有新扭矩反馈便暂停推进。
+- **力矩方向与机构方向要分别确认。** 当前机构夹紧反馈通常为负，但阈值比较使用绝对值；是否允许运动则依据“小角度夹紧、大角度松开”的机构约定。
+- **协议编码量程必须与电机固件一致。** 改变 `P/V/Kp/Kd/T` 的缩放常量会改变所有打包和解包结果，不能把量程常量当作限幅参数随意修改。
+- **所有共享控制状态必须同步。** CAN 接收回调、TCP 命令线程和 2 ms 控制线程会并发读写状态；新增字段应放在同一状态锁保护下，发送锁不要与硬件控制锁形成反向嵌套。
+- **始终保留松开和下电路径。** 限力状态不能拦截增大角度的松开命令；客户端异常、TCP 断开和进程退出都应进入失能/下电流程。
+- **不要让多个控制源竞争。** 图形界面、客户程序、手柄和自动动作不能同时直接写目标。应由一个仲裁层明确当前控制权。
+- **不要阻塞控制线程。** 日志、文件写入、网络等待和界面刷新必须与 2 ms CAN 发送周期解耦。
+- **软件限力不是安全功能。** 正式产品仍需固件电流/扭矩限制、硬件急停、机械限位以及必要的力传感器闭环。
 
 ## 6. 正常停机与异常处理
 
