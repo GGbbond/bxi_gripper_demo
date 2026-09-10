@@ -6,8 +6,8 @@ import unittest
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt5.QtWidgets import QApplication
-from gripper_demo import GripperDemo
+from PyQt5.QtWidgets import QApplication, QComboBox, QDoubleSpinBox
+from gripper_demo import GripperDemo, NoWheelComboBox, NoWheelDoubleSpinBox
 
 
 class SliderUiTest(unittest.TestCase):
@@ -75,6 +75,39 @@ class SliderUiTest(unittest.TestCase):
             self.assertEqual(rows[0]["command_position_deg"], "1.5")
             self.assertEqual(rows[0]["feedback_position_deg"], "1.4")
             self.assertEqual(rows[0]["feedback_sequence"], "42")
+
+    def test_position_limits_restrict_gui_and_commands(self):
+        self.window.connected = False
+        self.window.position_min_spin.setValue(-25.0)
+        self.window.position_max_spin.setValue(40.0)
+        self.assertTrue(self.window.apply_position_limits(send_backend=False))
+        self.assertEqual(self.window.target_spin.minimum(), -25.0)
+        self.assertEqual(self.window.target_spin.maximum(), 40.0)
+        self.assertEqual(self.window.slider.minimum(), -250)
+        self.assertEqual(self.window.slider.maximum(), 400)
+        self.window.connected = True
+        self.assertFalse(self.window.send_move(40.1, 10.0))
+        self.assertEqual(self.commands, [])
+        self.assertTrue(self.window.send_move(40.0, 10.0))
+        self.assertTrue(self.commands[0].startswith("CLAW_MOVE 40.00 "))
+
+    def test_wheel_is_ignored_by_inputs_and_dropdowns(self):
+        class Event:
+            ignored = False
+
+            def ignore(self):
+                self.ignored = True
+
+        for widget in (NoWheelDoubleSpinBox(), NoWheelComboBox()):
+            event = Event()
+            widget.wheelEvent(event)
+            self.assertTrue(event.ignored)
+        self.assertTrue(all(
+            isinstance(widget, NoWheelDoubleSpinBox)
+            for widget in self.window.findChildren(QDoubleSpinBox)))
+        self.assertTrue(all(
+            isinstance(widget, NoWheelComboBox)
+            for widget in self.window.findChildren(QComboBox)))
 
 
 if __name__ == "__main__":

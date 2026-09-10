@@ -16,6 +16,8 @@ static void reset(float position, float velocity)
     g_power_on = g_mode_entered = g_control_ready = 1;
     g_command_position = DEG_TO_RAD(position);
     g_command_velocity = DEG_TO_RAD(velocity);
+    g_position_min_deg = -360.0f;
+    g_position_max_deg = 360.0f;
 }
 
 static void target(float position, float speed)
@@ -42,6 +44,15 @@ static void step(float dt)
 
 int main(void)
 {
+    /* Configured travel limits are also enforced in the backend. */
+    reset(0.0f, 0.0f);
+    g_position_min_deg = -20.0f;
+    g_position_max_deg = 30.0f;
+    assert(start_motion(-20.0f, 10.0f, 300.0f, 5.0f, 1) == 0);
+    assert(start_motion(30.0f, 10.0f, 300.0f, 5.0f, 1) == 0);
+    assert(start_motion(-20.1f, 10.0f, 300.0f, 5.0f, 1) == -2);
+    assert(start_motion(30.1f, 10.0f, 300.0f, 5.0f, 1) == -2);
+
     /* A target moved close to the current trajectory must not reset velocity. */
     reset(10.0f, 180.0f);
     target(10.1f, 180.0f);

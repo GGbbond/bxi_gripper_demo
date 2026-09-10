@@ -46,7 +46,7 @@
 #define ZERO_POSITION_TOLERANCE_DEG 2.0f
 /* Critically damped slider follower: ~0.3 s to settle, no per-target velocity reset. */
 #define STREAM_FOLLOW_RATE 20.0f
-#define BACKEND_REVISION "slider-follow-v2"
+#define BACKEND_REVISION "position-limits-v3"
 
 typedef struct {
     float position;
@@ -94,6 +94,8 @@ static float g_command_kp = 0.0f;
 static float g_command_kd = 0.0f;
 static float g_target_kp = 300.0f;
 static float g_target_kd = 5.0f;
+static float g_position_min_deg = -360.0f;
+static float g_position_max_deg = 360.0f;
 static motor_feedback g_feedback;
 static motion_state g_motion;
 static pthread_t g_control_thread;
@@ -405,10 +407,13 @@ static void *control_loop(void *arg)
 static int start_motion(float position_deg, float speed_deg_s,
                         float kp, float kd, int stream)
 {
-    int ready;
+    int result = 0;
     pthread_mutex_lock(&g_state_lock);
-    ready = g_power_on && g_mode_entered && g_control_ready;
-    if (ready) {
+    if (!(g_power_on && g_mode_entered && g_control_ready)) {
+        result = -1;
+    } else if (position_deg < g_position_min_deg || position_deg > g_position_max_deg) {
+        result = -2;
+    } else {
         const float target = DEG_TO_RAD(clampf(position_deg, -360.0f, 360.0f));
         const float speed = DEG_TO_RAD(fabsf(speed_deg_s));
         g_target_kp = clampf(kp, KP_MIN, KP_MAX);
@@ -430,7 +435,7 @@ static int start_motion(float position_deg, float speed_deg_s,
         }
     }
     pthread_mutex_unlock(&g_state_lock);
-    return ready ? 0 : -1;
+    return result;
 }
 
 static void stop_and_hold(void)
@@ -585,6 +590,24 @@ static void handle_command(int fd, const char *command)
         send_line("MOTOR_ID_SET %u\n", value);
         return;
     }
+    if (sscanf(command, "SET_POSITION_LIMITS %f %f", &position, &speed) == 2) {
+        if (!isfinite(position) || !isfinite(speed) || position < -360.0f ||
+            speed > 360.0f || position > 0.0f || speed < 0.0f || position >= speed) {
+            send_line("ERROR invalid position limits\n");
+            return;
+        }
+        pthread_mutex_lock(&g_state_lock);
+        if (g_power_on) {
+            pthread_mutex_unlock(&g_state_lock);
+            send_line("ERROR power off before changing position limits\n");
+            return;
+        }
+        g_position_min_deg = position;
+        g_position_max_deg = speed;
+        pthread_mutex_unlock(&g_state_lock);
+        send_line("POSITION_LIMITS_SET %.2f %.2f\n", position, speed);
+        return;
+    }
     if (strcmp(command, "MOTOR_POWER_ON") == 0) {
         pthread_mutex_lock(&g_state_lock);
         if (!g_power_on) {
@@ -625,10 +648,15 @@ static void handle_command(int fd, const char *command)
         if (!isfinite(position) || !isfinite(speed) || !isfinite(kp) || !isfinite(kd) ||
             position < -360.0f || position > 360.0f || speed <= 0.0f) {
             send_line("ERROR invalid claw move\n");
-        } else if (start_motion(position, speed, kp, kd, stream) != 0) {
-            send_line("ERROR motor is not ready\n");
-        } else if (!stream) {
-            send_line("CLAW_MOVE_STARTED\n");
+        } else {
+            const int motion_result = start_motion(position, speed, kp, kd, stream);
+            if (motion_result == -1) {
+                send_line("ERROR motor is not ready\n");
+            } else if (motion_result == -2) {
+                send_line("ERROR position outside configured limits\n");
+            } else if (!stream) {
+                send_line("CLAW_MOVE_STARTED\n");
+            }
         }
         return;
     }

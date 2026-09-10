@@ -43,6 +43,7 @@ SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 9999
 POSITION_MIN = -360.0
 POSITION_MAX = 360.0
+POSITION_LIMIT_STEP = 0.1
 PEAK_FACTOR = 1.875
 
 
@@ -52,6 +53,20 @@ def resource_path(*parts):
 
 
 BACKEND_PATH = resource_path("build", "bin", "gripper_backend")
+
+
+class NoWheelComboBox(QComboBox):
+    """A combo box that cannot be changed accidentally by the mouse wheel."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """A numeric input that only changes through keyboard or arrow buttons."""
+
+    def wheelEvent(self, event):
+        event.ignore()
 
 
 class ValueCard(QFrame):
@@ -92,6 +107,8 @@ class GripperDemo(QMainWindow):
         self.connect_deadline = 0.0
         self.feedback_position = 0.0
         self.command_position = 0.0
+        self.position_min = POSITION_MIN
+        self.position_max = POSITION_MAX
         self.slider_pending = None
         self.action_running = False
         self.action_paused = False
@@ -229,10 +246,10 @@ class GripperDemo(QMainWindow):
 
         device_group = QGroupBox("设备")
         device_form = QFormLayout(device_group)
-        self.can_combo = QComboBox()
+        self.can_combo = NoWheelComboBox()
         for bus in range(7):
             self.can_combo.addItem(f"CAN{bus}", bus)
-        self.id_combo = QComboBox()
+        self.id_combo = NoWheelComboBox()
         for motor_id in range(9):
             self.id_combo.addItem(str(motor_id), motor_id)
         self.can_combo.currentIndexChanged.connect(self.apply_device)
@@ -255,18 +272,30 @@ class GripperDemo(QMainWindow):
         control_group = QGroupBox("位置控制")
         control = QVBoxLayout(control_group)
         form = QGridLayout()
+        self.position_min_spin = self.spin(
+            POSITION_MIN, 0.0, POSITION_MIN, POSITION_LIMIT_STEP, " deg", 1)
+        self.position_max_spin = self.spin(
+            0.0, POSITION_MAX, POSITION_MAX, POSITION_LIMIT_STEP, " deg", 1)
+        self.position_min_spin.setToolTip("允许夹爪到达的最小位置；修改范围前请先下电")
+        self.position_max_spin.setToolTip("允许夹爪到达的最大位置；修改范围前请先下电")
+        self.position_min_spin.editingFinished.connect(self.apply_position_limits)
+        self.position_max_spin.editingFinished.connect(self.apply_position_limits)
         self.target_spin = self.spin(POSITION_MIN, POSITION_MAX, 0, 0.1, " deg", 2)
         self.speed_spin = self.spin(0.1, 5000, 180, 1, " deg/s", 1)
         self.kp_spin = self.spin(0, 500, 300, 1, "", 2)
         self.kd_spin = self.spin(0, 5, 5, 0.1, "", 2)
-        form.addWidget(QLabel("目标位置"), 0, 0)
-        form.addWidget(self.target_spin, 0, 1)
-        form.addWidget(QLabel("峰值速度"), 1, 0)
-        form.addWidget(self.speed_spin, 1, 1)
-        form.addWidget(QLabel("Kp"), 2, 0)
-        form.addWidget(self.kp_spin, 2, 1)
-        form.addWidget(QLabel("Kd"), 3, 0)
-        form.addWidget(self.kd_spin, 3, 1)
+        form.addWidget(QLabel("活动范围最小值"), 0, 0)
+        form.addWidget(self.position_min_spin, 0, 1)
+        form.addWidget(QLabel("活动范围最大值"), 1, 0)
+        form.addWidget(self.position_max_spin, 1, 1)
+        form.addWidget(QLabel("目标位置"), 2, 0)
+        form.addWidget(self.target_spin, 2, 1)
+        form.addWidget(QLabel("峰值速度"), 3, 0)
+        form.addWidget(self.speed_spin, 3, 1)
+        form.addWidget(QLabel("Kp"), 4, 0)
+        form.addWidget(self.kp_spin, 4, 1)
+        form.addWidget(QLabel("Kd"), 5, 0)
+        form.addWidget(self.kd_spin, 5, 1)
         control.addLayout(form)
 
         self.slider = QSlider(Qt.Horizontal)
@@ -372,7 +401,7 @@ class GripperDemo(QMainWindow):
 
     @staticmethod
     def spin(low, high, value, step, suffix, decimals):
-        widget = QDoubleSpinBox()
+        widget = NoWheelDoubleSpinBox()
         widget.setRange(low, high)
         widget.setValue(value)
         widget.setSingleStep(step)
@@ -470,6 +499,17 @@ class GripperDemo(QMainWindow):
         self.kp_spin.setValue(float(self.settings.value("kp", 300.0)))
         self.kd_spin.setValue(float(self.settings.value("kd", 5.0)))
         self.return_speed.setValue(float(self.settings.value("return_speed", 180.0)))
+        try:
+            position_min = float(self.settings.value("position_min", POSITION_MIN))
+            position_max = float(self.settings.value("position_max", POSITION_MAX))
+        except (TypeError, ValueError):
+            position_min, position_max = POSITION_MIN, POSITION_MAX
+        if not (POSITION_MIN <= position_min <= 0.0 <= position_max <= POSITION_MAX
+                and position_min < position_max):
+            position_min, position_max = POSITION_MIN, POSITION_MAX
+        self.position_min_spin.setValue(position_min)
+        self.position_max_spin.setValue(position_max)
+        self.apply_position_limits(send_backend=False, announce=False)
 
     def save_settings(self):
         self.settings.setValue("can_bus", self.can_combo.currentData())
@@ -478,6 +518,35 @@ class GripperDemo(QMainWindow):
         self.settings.setValue("kp", self.kp_spin.value())
         self.settings.setValue("kd", self.kd_spin.value())
         self.settings.setValue("return_speed", self.return_speed.value())
+        self.settings.setValue("position_min", self.position_min)
+        self.settings.setValue("position_max", self.position_max)
+
+    def apply_position_limits(self, send_backend=True, announce=True):
+        position_min = self.position_min_spin.value()
+        position_max = self.position_max_spin.value()
+        if position_min >= position_max:
+            self.position_min_spin.setValue(self.position_min)
+            self.position_max_spin.setValue(self.position_max)
+            if announce:
+                QMessageBox.warning(self, "活动范围无效", "最小位置必须小于最大位置。")
+            return False
+
+        self.slider_pending = None
+        if hasattr(self, "slider_timer"):
+            self.slider_timer.stop()
+        self.position_min = position_min
+        self.position_max = position_max
+        self.target_spin.setRange(position_min, position_max)
+        self.slider.blockSignals(True)
+        self.slider.setRange(round(position_min * 10), round(position_max * 10))
+        self.slider.blockSignals(False)
+        if send_backend and self.connected:
+            self.send_command(
+                f"SET_POSITION_LIMITS {position_min:.2f} {position_max:.2f}")
+        if announce:
+            self.action_status.setText(
+                f"夹爪活动范围已设为 {position_min:.1f}° 到 {position_max:.1f}°")
+        return True
 
     def toggle_connection(self):
         if self.connected:
@@ -567,6 +636,8 @@ class GripperDemo(QMainWindow):
             if line and not line.startswith("HELLO "):
                 self.handle_line(line)
         self.apply_device()
+        self.send_command(
+            f"SET_POSITION_LIMITS {self.position_min:.2f} {self.position_max:.2f}")
         self.send_command(f"SET_GAINS {self.kp_spin.value():.2f} {self.kd_spin.value():.2f}")
         self.update_ui()
         return True
@@ -731,6 +802,8 @@ class GripperDemo(QMainWindow):
             self.action_status.setText("已停止，保持当前位置")
         elif key == "GAINS_SET":
             self.action_status.setText(f"Kp/Kd 已应用：{parts[1]} / {parts[2]}")
+        elif key == "POSITION_LIMITS_SET":
+            self.action_status.setText(f"夹爪活动范围已应用：{parts[1]}° 到 {parts[2]}°")
         elif key == "ERROR":
             backend_message = " ".join(parts[1:])
             if backend_message in {
@@ -765,6 +838,9 @@ class GripperDemo(QMainWindow):
             "motor power on failed": "硬件上电失败",
             "power off before changing CAN": "请先下电再切换 CAN 通道",
             "power off before changing motor ID": "请先下电再切换电机 ID",
+            "power off before changing position limits": "请先下电再修改夹爪活动范围",
+            "invalid position limits": "夹爪活动范围无效",
+            "position outside configured limits": "目标位置超出夹爪活动范围",
         }.get(message, message)
 
     def poll_status(self):
@@ -828,6 +904,10 @@ class GripperDemo(QMainWindow):
 
     def send_move(self, position, speed, stream=False):
         if not self.connected or not self.power_ready or self.zero_in_progress:
+            return False
+        if not self.position_min <= position <= self.position_max:
+            self.action_status.setText(
+                f"目标位置必须在 {self.position_min:.1f}° 到 {self.position_max:.1f}° 之间")
             return False
         name = "CLAW_STREAM" if stream else "CLAW_MOVE"
         return self.send_command(
@@ -970,8 +1050,9 @@ class GripperDemo(QMainWindow):
         if value is None or not math.isfinite(value):
             self.action_status.setText("动作表中存在无效数字")
             return
-        if column == 0 and not POSITION_MIN <= value <= POSITION_MAX:
-            self.action_status.setText("位置必须在 -360° 到 360° 之间")
+        if column == 0 and not self.position_min <= value <= self.position_max:
+            self.action_status.setText(
+                f"位置必须在 {self.position_min:.1f}° 到 {self.position_max:.1f}° 之间")
             return
         if column == 3 and value < 0:
             self.action_status.setText("等待时间不能小于 0")
@@ -1015,7 +1096,8 @@ class GripperDemo(QMainWindow):
         for row in range(self.table.rowCount()):
             position = self.cell_value(row, 0)
             wait = self.cell_value(row, 3)
-            if position is None or not POSITION_MIN <= position <= POSITION_MAX or wait is None or wait < 0:
+            if (position is None or not self.position_min <= position <= self.position_max
+                    or wait is None or wait < 0):
                 return None
             speed = self.return_speed.value() if row == 0 else self.cell_value(row, 1)
             duration = 0.0 if row == 0 else self.cell_value(row, 2)
@@ -1175,6 +1257,9 @@ class GripperDemo(QMainWindow):
             )
         )
         self.slider.setEnabled(controls_ready)
+        limits_editable = not (self.power_ready or self.power_requested)
+        self.position_min_spin.setEnabled(limits_editable)
+        self.position_max_spin.setEnabled(limits_editable)
         self.pause_button.setEnabled(self.action_running)
         self.stop_button.setEnabled(self.action_running or self.action_paused)
 
