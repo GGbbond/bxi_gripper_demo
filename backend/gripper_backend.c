@@ -44,8 +44,9 @@
 #define ZERO_FRAME_REPEAT 3
 #define ZERO_FEEDBACK_TIMEOUT_MS 1000LL
 #define ZERO_POSITION_TOLERANCE_DEG 2.0f
-#define STREAM_POSITION_EPS_DEG 0.01f
-#define STREAM_VELOCITY_EPS_DEG_S 0.1f
+/* Critically damped slider follower: ~0.3 s to settle, no per-target velocity reset. */
+#define STREAM_FOLLOW_RATE 20.0f
+#define BACKEND_REVISION "slider-follow-v2"
 
 typedef struct {
     float position;
@@ -300,31 +301,25 @@ static void update_move_locked(long long now_ms, int *completed)
 
 static void update_stream_locked(float dt)
 {
+    if (!isfinite(dt) || dt <= 0.0f) return;
     const float error = g_motion.target_position - g_command_position;
-    const float direction = error >= 0.0f ? 1.0f : -1.0f;
-    const float braking_speed = sqrtf(fmaxf(0.0f, 2.0f * g_motion.acceleration * fabsf(error)));
-    const float wanted_velocity = direction * fminf(g_motion.peak_velocity, braking_speed);
+    const float old_velocity = g_command_velocity;
+    const float rate = STREAM_FOLLOW_RATE;
+    /* Exact velocity of a critically damped second-order follower over dt.
+     * Close targets therefore reduce speed continuously rather than being
+     * chased at peak speed and snapped to rest when crossed. */
+    const float follow_velocity =
+        (old_velocity + (rate * rate * error - rate * old_velocity) * dt) *
+        expf(-rate * dt);
+    const float wanted_velocity = clampf(
+        follow_velocity, -g_motion.peak_velocity, g_motion.peak_velocity);
     const float max_change = g_motion.acceleration * dt;
-    g_command_velocity += clampf(wanted_velocity - g_command_velocity,
-                                 -max_change, max_change);
-    float step = g_command_velocity * dt;
-    const int moving_toward_target = step * error > 0.0f;
-    const int would_cross_target =
-        moving_toward_target && fabsf(step) >= fabsf(error);
-    const int settled =
-        fabsf(error) < DEG_TO_RAD(STREAM_POSITION_EPS_DEG) &&
-        fabsf(g_command_velocity) < DEG_TO_RAD(STREAM_VELOCITY_EPS_DEG_S);
-    if (would_cross_target || settled) {
-        g_command_position = g_motion.target_position;
-        g_command_velocity = 0.0f;
-    } else {
-        const float next_position = g_command_position + step;
-        g_command_position = clampf(
-            next_position, DEG_TO_RAD(-360.0f), DEG_TO_RAD(360.0f));
-        if (g_command_position != next_position) {
-            g_command_velocity = 0.0f;
-        }
-    }
+    g_command_velocity = old_velocity + clampf(
+        wanted_velocity - old_velocity, -max_change, max_change);
+    /* Keep p_des and v_des consistent, including speed changes and reversals.
+     * The UI range constrains requested targets, not measured/start positions:
+     * hard-clamping the latter creates an instantaneous position command step. */
+    g_command_position += 0.5f * (old_velocity + g_command_velocity) * dt;
 }
 
 static void *control_loop(void *arg)
@@ -340,6 +335,9 @@ static void *control_loop(void *arg)
         int send_enter = 0;
         int completed = 0;
         motor_feedback feedback;
+        float trace_position, trace_velocity, trace_target;
+        int trace_power, trace_ready;
+        long long trace_time;
         long long now = monotonic_ms();
         float dt = clampf((float)(now - last_ms) / 1000.0f, 0.001f, 0.02f);
         last_ms = now;
@@ -368,6 +366,13 @@ static void *control_loop(void *arg)
             send_control = 1;
         }
         feedback = g_feedback;
+        trace_position = g_command_position;
+        trace_velocity = g_command_velocity;
+        trace_target = g_motion.kind == MOTION_IDLE
+            ? g_command_position : g_motion.target_position;
+        trace_power = g_power_on;
+        trace_ready = g_control_ready;
+        trace_time = monotonic_ms();
         pthread_mutex_unlock(&g_state_lock);
 
         if (send_enter) {
@@ -383,6 +388,14 @@ static void *control_loop(void *arg)
                           RAD_TO_DEG(feedback.position), RAD_TO_DEG(feedback.velocity),
                           feedback.torque, feedback.mos_temp, feedback.rotor_temp);
             }
+            /* Atomic snapshot for comparing reference commands and feedback.
+             * Invalid feedback is explicitly marked by age=-1. */
+            send_line("TRACE %lld %.6f %.6f %.6f %.6f %.6f %.6f %u %lld %d %d\n",
+                      trace_time, RAD_TO_DEG(trace_position), RAD_TO_DEG(trace_velocity),
+                      RAD_TO_DEG(trace_target), RAD_TO_DEG(feedback.position),
+                      RAD_TO_DEG(feedback.velocity), feedback.torque, feedback.sequence,
+                      feedback.valid ? trace_time - feedback.updated_ms : -1LL,
+                      trace_power, trace_ready);
         }
         usleep(CONTROL_PERIOD_US);
     }
@@ -755,7 +768,8 @@ int main(void)
         g_client_fd = fd;
         pthread_mutex_unlock(&g_send_lock);
         send_line("HELLO BXI_GRIPPER_DEMO 1\n");
-        log_line("Client connected");
+        log_line("Client connected; backend %s (%s %s)",
+                 BACKEND_REVISION, __DATE__, __TIME__);
 
         char input[2048];
         size_t used = 0;

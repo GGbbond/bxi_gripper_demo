@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import json
+import csv
+from collections import deque
 import math
 import os
 import socket
@@ -97,6 +99,7 @@ class GripperDemo(QMainWindow):
         self.action_points = []
         self.log_dialog = None
         self.log_dialog_output = None
+        self.motion_trace = deque(maxlen=6000)
         self.action_wait_timer = QTimer(self)
         self.action_wait_timer.setSingleShot(True)
         self.action_wait_timer.timeout.connect(self.advance_action)
@@ -417,10 +420,14 @@ class GripperDemo(QMainWindow):
         buttons = QHBoxLayout()
         buttons.addStretch()
         clear_button = QPushButton("清空日志")
+        export_button = QPushButton("导出运动诊断 CSV")
+        export_button.setToolTip("导出最近约两分钟的位置指令、速度指令与电机反馈")
+        export_button.clicked.connect(self.export_motion_trace)
         close_button = QPushButton("关闭")
         clear_button.clicked.connect(self.clear_logs)
         close_button.clicked.connect(dialog.close)
         buttons.addWidget(clear_button)
+        buttons.addWidget(export_button)
         buttons.addWidget(close_button)
         layout.addWidget(output, 1)
         layout.addLayout(buttons)
@@ -432,6 +439,27 @@ class GripperDemo(QMainWindow):
     def log_dialog_closed(self, _result=None):
         self.log_dialog = None
         self.log_dialog_output = None
+
+    def export_motion_trace(self):
+        if not self.motion_trace:
+            QMessageBox.information(self, "没有运动诊断数据", "请连接新版后端后再导出。")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出运动诊断", "gripper_motion.csv", "CSV 文件 (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as output:
+                writer = csv.writer(output)
+                writer.writerow(("backend_monotonic_ms", "command_position_deg",
+                                 "command_velocity_deg_s", "target_position_deg",
+                                 "feedback_position_deg", "feedback_velocity_deg_s",
+                                 "feedback_torque_Nm", "feedback_sequence",
+                                 "feedback_age_ms", "power_on", "control_ready"))
+                writer.writerows(self.motion_trace)
+            self.append_log(f"运动诊断已导出：{path}")
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
 
     def load_settings(self):
         can_bus = int(self.settings.value("can_bus", 2))
@@ -528,6 +556,7 @@ class GripperDemo(QMainWindow):
             return False
         self.sock = sock
         self.connected = True
+        self.motion_trace.clear()
         self.rx_buffer = b""
         self.rx_timer.start()
         self.status_timer.start()
@@ -552,6 +581,7 @@ class GripperDemo(QMainWindow):
         self.rx_timer.stop()
         self.status_timer.stop()
         self.slider_timer.stop()
+        self.slider_pending = None
         self.action_wait_timer.stop()
         self.action_running = False
         self.action_paused = False
@@ -616,6 +646,14 @@ class GripperDemo(QMainWindow):
             return
         parts = line.split()
         key = parts[0]
+        if key == "TRACE":
+            if len(parts) == 12:
+                try:
+                    if all(math.isfinite(float(value)) for value in parts[1:]):
+                        self.motion_trace.append(tuple(parts[1:]))
+                except ValueError:
+                    pass
+            return
         try:
             if key == "POS":
                 self.feedback_position = float(parts[1])
@@ -666,6 +704,7 @@ class GripperDemo(QMainWindow):
             else:
                 self.action_status.setText("已到达目标位置并保持")
         elif key == "CLAW_ZERO_COMPLETE":
+            self.cancel_slider_command()
             self.zero_in_progress = False
             self.power_ready = True
             self.motor_disabled = False
@@ -741,6 +780,7 @@ class GripperDemo(QMainWindow):
         if not self.connected:
             return
         if self.power_requested or self.power_ready:
+            self.cancel_slider_command()
             self.stop_actions()
             self.send_command("MOTOR_POWER_OFF")
         else:
@@ -756,6 +796,7 @@ class GripperDemo(QMainWindow):
         self.action_status.setText("已执行急停并下电")
 
     def toggle_motor_enabled(self):
+        self.cancel_slider_command()
         if self.motor_disabled:
             if self.send_command("CLAW_ENABLE"):
                 self.motor_enabling = True
@@ -786,6 +827,8 @@ class GripperDemo(QMainWindow):
         self.send_command(f"SET_GAINS {self.kp_spin.value():.2f} {self.kd_spin.value():.2f}")
 
     def send_move(self, position, speed, stream=False):
+        if not self.connected or not self.power_ready or self.zero_in_progress:
+            return False
         name = "CLAW_STREAM" if stream else "CLAW_MOVE"
         return self.send_command(
             f"{name} {position:.2f} {speed:.2f} "
@@ -794,6 +837,7 @@ class GripperDemo(QMainWindow):
         )
 
     def go_target(self):
+        self.cancel_slider_command()
         self.stop_actions()
         target = self.target_spin.value()
         self.set_command_position(target)
@@ -812,8 +856,12 @@ class GripperDemo(QMainWindow):
         self.command_label.setText(f"命令: {position:.2f} deg")
 
     def slider_changed(self, value):
+        if not self.connected or not self.power_ready or self.zero_in_progress:
+            return
         if self.action_running or self.action_paused:
-            self.stop_actions()
+            # Let CLAW_STREAM continue the backend reference trajectory.
+            # CLAW_STOP would first jump p_des back to measured feedback.
+            self.stop_actions(send_stop=False)
         position = value / 10.0
         self.set_command_position(position)
         self.slider_pending = position
@@ -821,12 +869,19 @@ class GripperDemo(QMainWindow):
             self.slider_timer.start()
 
     def flush_slider(self):
+        if not self.connected or not self.power_ready or self.zero_in_progress:
+            self.cancel_slider_command()
+            return
         if self.slider_pending is None:
             self.slider_timer.stop()
             return
         position = self.slider_pending
         self.slider_pending = None
         self.send_move(position, self.speed_spin.value(), stream=True)
+
+    def cancel_slider_command(self):
+        self.slider_pending = None
+        self.slider_timer.stop()
 
     def add_feedback_point(self):
         self.add_point(self.feedback_position)
@@ -971,6 +1026,7 @@ class GripperDemo(QMainWindow):
         return points
 
     def start_actions(self):
+        self.cancel_slider_command()
         if self.action_paused:
             self.action_paused = False
             self.action_running = True
